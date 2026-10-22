@@ -1,0 +1,6 @@
+# laid by Claude Code on each load of the mod
+.claude-plugin/types/
+node_modules/
+
+# workflow planning notes
+.iwo/

@@ -1,0 +1,52 @@
+{
+  "name": "claudefolder",
+  "version": "0.1.0",
+  "description": "Folds each finished turn of the chat into one or two highlighted lines (the prompt, the turn number, the first line of the answer, the tools, the edited files and the time) that unfold with a click, set apart by a tinted band and an edge bar, a card, alternating tints or a rule, with a gliding light over the folds",
+  "author": { "name": "AndreaChiacchia", "url": "https://github.com/AndreaChiacchia" },
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "userConfig": {
+    "style": {
+      "type": "string",
+      "title": "Turn style",
+      "description": "How turns stand apart. rail: each turn's header sits on a faint tinted band with a teal bar on its left edge, teal-slate when folded and lavender when open, and an open turn keeps the bar down every one of its rows; a folded header starts with the marker and the number (▌ ▸ #3 · title). boxed: a folded turn is a round-cornered card with its marker and number in the top border (╭─ ▸ #3 ─╮) and its title and first answer line inside; an open turn sits inside its card, with the marker and the number in the top border, a side down every row and the bottom border under its last line. zebra: folded turns alternate two faint tints and an open turn's header is lavender, each band with rounded ends (▐ ▌), with no bar and no extra lines; a folded band starts with the marker and the number (▐▸ #3 · title). rules: a folded turn has a teal line holding its marker, number and time above its title lines; an open turn is one grey line holding its marker and number. In every style an open turn's header shows only the marker and the number (▾ #3).",
+      "default": "rail",
+      "options": ["rail", "boxed", "zebra", "rules"]
+    },
+    "foldWhen": {
+      "type": "string",
+      "title": "Fold a turn",
+      "description": "next: a finished turn folds when the next one starts, so the answer you are reading stays open until you send your next prompt. finish: a turn folds 1.5 s after it ends. The running turn never folds; a click on a folded turn, or /folder, opens it again.",
+      "default": "next",
+      "options": ["next", "finish"]
+    },
+    "lines": {
+      "type": "string",
+      "title": "Folded lines",
+      "description": "2: the turn number and the prompt on the first line, then the first line of the answer with the tool count, the edited files and the time. 1: the first line alone, with the tools, files and time after the title. 3: the turn number and the prompt, then the first line of the answer on a line of its own, then the tools, the edited files by name and the time.",
+      "default": "2",
+      "options": ["1", "2", "3"]
+    },
+    "marker": {
+      "type": "string",
+      "title": "Fold marker",
+      "description": "The glyph before each turn, folded then open. triangles: ▸ ▾. hollow: ▹ ▿. plus: + −. ascii: > v, for fonts without these glyphs.",
+      "default": "triangles",
+      "options": ["triangles", "hollow", "plus", "ascii"]
+    },
+    "edge": {
+      "type": "string",
+      "title": "Edge bar",
+      "description": "The bar on the left edge of a turn in the rail style. half: ▌. thin: ▎. line: │. ascii: |, for fonts without these glyphs.",
+      "default": "half",
+      "options": ["half", "thin", "line", "ascii"]
+    },
+    "motion": {
+      "type": "string",
+      "title": "Motion",
+      "description": "How the folds move. lively: a turn that folds or opens flips its marker with a gold flash and sends one light round its header's outline (a folded card's whole border, an open card's top line, the header's edge bar cell, the rule, a zebra band's ends); pointing at a header's marker and number sends one lap too. subtle: the same with a softer flash and light, the light on a fold or an open only. off: still lines; pointing still highlights the marker and number and a click still folds or opens.",
+      "default": "lively",
+      "options": ["lively", "subtle", "off"]
+    }
+  }
+}
