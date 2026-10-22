@@ -1037,15 +1037,17 @@ export const register: Register = (on, options) => {
       const c = counters.get(turnId)
       const reply = replyOf(e.answer)
       const status = e.reason === 'aborted' ? 'interrupted' : e.reason === 'answer' ? 'done' : 'error'
+      const late = tracker.lateCommands.get(turnId)
       await changeTurn($, turnId, t => ({
         ...t,
+        title: late === undefined ? t.title : titleOf('', late),
         reply,
         tools: c === undefined ? t.tools : c.tools,
         files: c === undefined ? t.files : [...c.files],
         durationMs: e.durationMs,
         status,
         // The final values come from memory at the end: a lost race during the turn cannot leave them empty.
-        header: t.header ?? tracker.headers.get(turnId) ?? null,
+        header: tracker.headers.get(turnId) ?? t.header ?? null,
         closer: tracker.closers.get(turnId)?.id ?? t.closer,
       }))
       $.ui.log(

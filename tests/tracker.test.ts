@@ -7,8 +7,11 @@ import {
   createTracker,
   headerIdOf,
   idsOf,
+  isCommandEcho,
+  isCompanion,
   isLocalCommandOutput,
   isPersonPrompt,
+  isPlainCommandLine,
   isStarter,
   isTyped,
   onAgentLaunched,
@@ -46,6 +49,18 @@ const notificationText = (agent: string, summary = 'Agent "x" finished') =>
 const notification = (id: string, agent: string, summary = 'Agent "x" finished') =>
   row(id, 'prompt', 'user', [text(notificationText(agent, summary))], false, undefined, 'task-notification')
 const handBack = (id: string) => row(id, 'prompt', 'user', [text('Another Claude session sent a message')], true, undefined, 'peer')
+const SKILL_TEXT = 'Base directory for this skill: C:\\skills\\iwo'
+const skillText = (id: string) => row(id, 'prompt', 'user', [text(SKILL_TEXT)], true, undefined, 'unclassified')
+const skillCommand = (id: string) =>
+  row(
+    id,
+    'command',
+    'user',
+    [text('<command-message>iwo</command-message>\n<command-name>/iwo</command-name>\n<command-args>balanced fix it</command-args>')],
+    false,
+    undefined,
+    'composer',
+  )
 
 test('a prompt waits as pending and the turn that starts adopts its rows and header', () => {
   const t = createTracker()
@@ -120,8 +135,16 @@ test("turn.start before the prompt's append: the prompt becomes the running head
 
 test('two meta starters: the first is the header; a typed prompt after them starts a group of its own', () => {
   const t = createTracker()
-  expect(onAppend(t, row('m0', 'prompt', 'user', [text('reminder')], true))).toEqual(NOTHING)
-  expect(t.pending).toEqual({ kind: 'meta', ids: ['m0'], header: 'm0', command: null, closer: plain('m0'), text: 'reminder', startKind: 'other' })
+  expect(onAppend(t, row('m0', 'prompt', 'user', [text('reminder')], true, undefined, 'scheduled-trigger'))).toEqual(NOTHING)
+  expect(t.pending).toEqual({
+    kind: 'meta',
+    ids: ['m0'],
+    header: 'm0',
+    command: null,
+    closer: plain('m0'),
+    text: 'reminder',
+    startKind: 'other',
+  })
   onAppend(t, row('m1', 'delivery', 'user', [text('second')], true))
   expect(t.pending).toMatchObject({ kind: 'meta', ids: ['m0', 'm1'], header: 'm0', text: 'reminder' })
   onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
@@ -528,6 +551,194 @@ test('the tracker keeps the row keys of each turn: adopted, running and tail row
   onAppend(t, row('b6d78f44-8266-4aaa-84e5-0041bd1ce1bd', 'prompt', 'user', [text('again')]))
   onTurnStart(t, 't2')
   expect(t.ids.get('t2')).toEqual(['b6d78f44-8266-4aaa-84e5'])
+})
+
+// ---- slash commands and skills: the first reply is the header, the command titles the turn --------
+
+test('a skill whose expanded text comes before its command row: the command row gives the title and the kind; the first reply is the header', () => {
+  const t = createTracker()
+  expect(onAppend(t, skillText('s1'))).toEqual(NOTHING)
+  expect(t.pending).toMatchObject({ kind: 'meta', header: null, companion: true })
+  expect(onAppend(t, skillCommand('c1'))).toEqual(NOTHING)
+  expect(t.pending).toEqual({
+    kind: 'command',
+    ids: ['s1', 'c1'],
+    header: null,
+    command: '/iwo balanced fix it',
+    closer: plain('c1'),
+    text: null,
+    startKind: 'other',
+  })
+  expect(onTurnStart(t, 't1')).toMatchObject({ assign: ['s1', 'c1'], header: null, command: '/iwo balanced fix it', startKind: 'other' })
+  expect(t.runningUntitled).toBe(false)
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(t.headers.get('t1')).toBe('a1')
+})
+
+test('the command row first and its expanded text after: no header until the first reply', () => {
+  const t = createTracker()
+  onAppend(t, skillCommand('c1'))
+  onAppend(t, skillText('s1'))
+  expect(t.pending).toMatchObject({ kind: 'command', ids: ['c1', 's1'], header: null, command: '/iwo balanced fix it' })
+  expect(t.pending?.companion).toBeUndefined()
+  expect(onTurnStart(t, 't1').header).toBeNull()
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(t.headers.get('t1')).toBe('a1')
+})
+
+test('turn.start before both rows: the command row titles the turn, the first reply is the header', () => {
+  const t = createTracker()
+  onTurnStart(t, 't1')
+  onAppend(t, skillText('s1'))
+  expect(t.headers.has('t1')).toBe(false)
+  expect(t.runningUntitled).toBe(true)
+  expect(onAppend(t, skillCommand('c1'))).toEqual({ assign: ['c1'], to: 't1', closer: 'c1' })
+  expect(t.runningHeader).toBeNull()
+  expect(t.lateCommands.get('t1')).toBe('/iwo balanced fix it')
+  expect(t.runningUntitled).toBe(false)
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(t.headers.get('t1')).toBe('a1')
+})
+
+test('turn.start between the expanded text and the command row: the same', () => {
+  const t = createTracker()
+  onAppend(t, skillText('s1'))
+  expect(onTurnStart(t, 't1').header).toBeNull()
+  expect(t.runningUntitled).toBe(true)
+  onAppend(t, skillCommand('c1'))
+  expect(t.lateCommands.get('t1')).toBe('/iwo balanced fix it')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(t.headers.get('t1')).toBe('a1')
+})
+
+test("after the turn's first reply a command row neither titles the turn nor takes the header", () => {
+  const t = createTracker()
+  onTurnStart(t, 't1')
+  onAppend(t, skillText('s1'))
+  onAppend(t, row('a1', 'response', 'assistant', [text('Ok')]))
+  onAppend(t, row('c2', 'command', 'user', [text('<command-name>/model</command-name>')]))
+  expect(t.headers.get('t1')).toBe('a1')
+  expect(t.lateCommands.has('t1')).toBe(false)
+})
+
+test('a hand-back, a notification, a typed prompt or a stamped meta starter keeps its header against a command row', () => {
+  const a = createTracker()
+  onAppend(a, handBack('h1'))
+  onAppend(a, skillCommand('c1'))
+  expect(a.pending).toMatchObject({ kind: 'meta', header: 'h1' })
+
+  const b = createTracker()
+  onAppend(b, notification('n1', 'a'))
+  onAppend(b, skillCommand('c1'))
+  expect(b.pending).toMatchObject({ header: 'n1' })
+
+  const c = createTracker()
+  onAppend(c, row('u1', 'prompt', 'user', [text('hi')]))
+  onAppend(c, skillCommand('c1'))
+  expect(c.pending).toMatchObject({ kind: 'typed', header: 'u1' })
+
+  const d = createTracker()
+  onAppend(d, row('m1', 'prompt', 'user', [text('reminder')], true, undefined, 'composer'))
+  onAppend(d, skillCommand('c1'))
+  expect(d.pending).toMatchObject({ header: 'm1' })
+
+  const e = createTracker()
+  onAppend(e, handBack('h2'))
+  onTurnStart(e, 't2')
+  onAppend(e, skillCommand('c3'))
+  expect(e.headers.get('t2')).toBe('h2')
+
+  const f = createTracker()
+  onAppend(f, row('u2', 'prompt', 'user', [text('hi')]))
+  onTurnStart(f, 't3')
+  onAppend(
+    f,
+    row('c4', 'command', 'user', [text('<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>')]),
+  )
+  expect(f.lateCommands.has('t3')).toBe(false)
+  expect(f.headers.get('t3')).toBe('u2')
+})
+
+test("a local command's group, then a skill: the skill's command row titles its group", () => {
+  const t = createTracker()
+  onAppend(t, row('c0', 'command', 'user', [text('<command-name>/clear</command-name>')]))
+  onAppend(t, row('o0', 'command', 'system', [text('x')], false, 'local_command'))
+  expect(t.pending?.local).toBe(true)
+  onAppend(t, skillText('s1'))
+  expect(t.pending).toMatchObject({ kind: 'meta', ids: ['s1'], companion: true })
+  onAppend(t, skillCommand('c1'))
+  expect(t.pending).toMatchObject({ kind: 'command', ids: ['s1', 'c1'], header: null })
+})
+
+test('isCompanion: a meta prompt row with no origin of its own, nothing else', () => {
+  expect(isCompanion(skillText('s'))).toBe(true)
+  expect(isCompanion(row('s', 'prompt', 'user', [text(SKILL_TEXT)], true))).toBe(true)
+  expect(isCompanion(handBack('h'))).toBe(false)
+  expect(isCompanion(notification('n', 'a'))).toBe(false)
+  expect(isCompanion(row('u', 'prompt', 'user', [text('x')]))).toBe(false)
+  expect(isCompanion(row('m', 'prompt', 'user', [text('x')], true, undefined, 'composer'))).toBe(false)
+  expect(isCompanion(row('d', 'delivery', 'user', [text('x')], true))).toBe(false)
+  expect(isCompanion(row('c', 'command', 'user', [text('<local-command-caveat>x</local-command-caveat>')], true))).toBe(false)
+})
+
+test("isCommandEcho: the person's command line, not its output, not meta", () => {
+  expect(isCommandEcho(skillCommand('c'))).toBe(true)
+  expect(isCommandEcho(row('c', 'command', 'user', [text('<command-name>/cost</command-name>')]))).toBe(true)
+  expect(isCommandEcho(row('o', 'command', 'user', [text('<local-command-stdout>a</local-command-stdout>')]))).toBe(false)
+  expect(
+    isCommandEcho(row('o', 'command', 'system', [text('<command-name>/folder</command-name><local-command-stdout>x</local-command-stdout>')], false, 'local_command')),
+  ).toBe(false)
+  expect(isCommandEcho(row('k', 'command', 'user', [text('<local-command-caveat>x</local-command-caveat>')], true))).toBe(false)
+  expect(isCommandEcho(row('x', 'command', 'user', [text('x')]))).toBe(false)
+  expect(isCommandEcho(row('u', 'prompt', 'user', [text('<command-name>/a</command-name>')]))).toBe(false)
+})
+
+test("isPlainCommandLine follows the engine's rule for the `> /name args` line", () => {
+  const command = (...texts: string[]) => row('c', 'command', 'user', texts.map(text))
+  const gap = ' '.repeat(12)
+  // Drawn as the engine's own command line: no render site.
+  expect(isPlainCommandLine(skillCommand('c'))).toBe(true)
+  expect(
+    isPlainCommandLine(
+      command('<command-name>/model</command-name>' + gap + '<command-message>model</command-message>' + gap + '<command-args></command-args>'),
+    ),
+  ).toBe(true)
+  expect(
+    isPlainCommandLine(
+      command(
+        '<command-message>anthropic-skills:iwo</command-message>\n<command-name>/anthropic-skills:iwo</command-name>\n<command-args>a\nb</command-args>',
+      ),
+    ),
+  ).toBe(true)
+  expect(isPlainCommandLine(command('<command-message>iwo</command-message><command-name>/iwo</command-name><skill-format>true</skill-format>'))).toBe(true)
+  // Drawn through the prompt component (a render site), or not a command line at all.
+  expect(isPlainCommandLine(command('<command-name>/cost</command-name><command-args></command-args>'))).toBe(false)
+  expect(isPlainCommandLine(command('<command-message>other</command-message><command-name>/iwo</command-name>'))).toBe(false)
+  expect(
+    isPlainCommandLine(command('<command-message>iwo</command-message><command-name>/iwo</command-name><command-contents>x</command-contents>')),
+  ).toBe(false)
+  expect(
+    isPlainCommandLine(
+      command('<command-message>iwo</command-message><command-name>/iwo</command-name><skill-format>true</skill-format><command-args>x</command-args>'),
+    ),
+  ).toBe(false)
+  expect(
+    isPlainCommandLine(command('<command-message>iwo</command-message><command-name>/iwo</command-name><skill-format>false</skill-format>')),
+  ).toBe(false)
+  expect(isPlainCommandLine(command('<command-message>iwo</command-message><command-name>/iwo</command-name> extra'))).toBe(false)
+  expect(
+    isPlainCommandLine(command('<command-message>iwo</command-message><command-message>iwo</command-message><command-name>/iwo</command-name>')),
+  ).toBe(false)
+  expect(isPlainCommandLine(row('c', 'command', 'user', skillCommand('c').blocks, true))).toBe(false)
+  expect(isPlainCommandLine(row('c', 'prompt', 'user', skillCommand('c').blocks))).toBe(false)
+  expect(isPlainCommandLine(command('<command-message>iwo</command-message><command-name>/iwo</command-name>', 'more'))).toBe(false)
+})
+
+test('headerIdOf: no header on a command line the engine draws itself, nor on the expanded text', () => {
+  expect(headerIdOf(skillCommand('c'))).toBeNull()
+  expect(headerIdOf(skillText('s'))).toBeNull()
+  expect(headerIdOf(row('c', 'command', 'user', [text('<command-name>/cost</command-name>')]))).toBe('c')
+  expect(headerIdOf(handBack('h'))).toBe('h')
 })
 
 // ---- background agents: the engine leaves some duration lines out ---------------------------------

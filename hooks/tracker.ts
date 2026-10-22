@@ -32,6 +32,8 @@ export type Pending = {
   startKind: StartKind
   /** True once the group holds a local command's output: that command starts no turn, so the next starter or command row starts a new group. */
   local?: true
+  /** True while a companion row (`isCompanion`) started the group: the person's command row that comes after it gives the group its title and kind. */
+  companion?: true
 }
 
 /** Which turn the rows being appended belong to. */
@@ -42,6 +44,10 @@ export type Tracker = {
   last: string | null
   /** The requestId of the row that draws the running turn's header, once found. */
   runningHeader: string | null
+  /** True from a turn.start that adopted no title of its own (nothing waiting, or only the expanded text of a skill) until the turn's first command row, other starter or response: a command row in that window gives the turn its title. */
+  runningUntitled: boolean
+  /** By turnId: the title (`/name args`) of the command row that came after the running turn started without a title; the turn's title when it completes. */
+  lateCommands: Map<string, string>
   pending: Pending | null
   /** By turnId: the row each turn's card closes under. */
   closers: Map<string, Closer>
@@ -63,6 +69,8 @@ export function createTracker(): Tracker {
     running: null,
     last: null,
     runningHeader: null,
+    runningUntitled: false,
+    lateCommands: new Map(),
     pending: null,
     closers: new Map(),
     headers: new Map(),
@@ -197,12 +205,14 @@ export function startKindOf(row: AppendRow): StartKind {
 }
 
 /**
- * The requestId of the row that draws a turn's header when this row is the first to offer one: a starter its uuid; a
- * command row the person sees its uuid; a response its uuid when it has text, else its first tool call; else null.
+ * The requestId of the row that draws a turn's header when this row is the first to offer one: a starter its uuid (not the
+ * expanded text the engine writes beside a prompt, which it does not draw); a command row the person sees and the engine
+ * draws through a render site its uuid (not a command line it draws as `> /name args`, which no hook reaches); a response
+ * its uuid when it has text, else its first tool call; else null.
  */
 export function headerIdOf(row: AppendRow): string | null {
-  if (isStarter(row)) return rowKeyOf(row.uuid)
-  if (row.door === 'command' && row.type === 'user' && !row.isMeta) return rowKeyOf(row.uuid)
+  if (isStarter(row)) return isCompanion(row) ? null : rowKeyOf(row.uuid)
+  if (row.door === 'command' && row.type === 'user' && !row.isMeta) return isPlainCommandLine(row) ? null : rowKeyOf(row.uuid)
   if (row.door === 'response') {
     if (hasText(row)) return rowKeyOf(row.uuid)
     for (const b of row.blocks) if (b.type === 'tool_use' && typeof b.id === 'string') return rowKeyOf(b.id)
@@ -257,6 +267,84 @@ export function commandTitleOf(row: AppendRow): string | null {
   return '/' + name + (args !== undefined && args.trim() !== '' ? ' ' + args.trim() : '')
 }
 
+/**
+ * True for a row the engine writes beside the person's prompt and does not draw: a meta user row at the door `prompt` with no
+ * origin of its own (`unclassified`): a skill's or a prompt command's expanded text, an image caption. It is never a turn's
+ * header: the engine does not draw it.
+ */
+export function isCompanion(row: AppendRow): boolean {
+  return row.type === 'user' && row.door === 'prompt' && row.isMeta && (row.origin === undefined || row.origin === 'unclassified')
+}
+
+/** True for the person's own line of a slash command (`/name args`) at the door `command`: not meta, with a command name, not a local command's output. */
+export function isCommandEcho(row: AppendRow): boolean {
+  return row.door === 'command' && row.type === 'user' && !row.isMeta && !isLocalCommandOutput(row) && commandTitleOf(row) !== null
+}
+
+/** The tags the engine reads in the text of a command row. */
+const COMMAND_TAGS = ['command-message', 'command-name', 'command-args', 'skill-format', 'command-contents']
+
+/**
+ * The command tags of a text, as the engine parses them: only those tags, one each, with whitespace between them (the
+ * arguments may run to the end of the text). Null when anything else is in the text, or a tag is repeated.
+ */
+function commandTagsOf(text: string): Map<string, string> | null {
+  // Sticky regexes keep their position: build them per call.
+  const argsToEnd = /<command-args>([\s\S]*)<\/command-args>\s*$/y
+  const oneTag = /<([a-z-]+)>([\s\S]*?)<\/\1>/y
+  const tags = new Map<string, string>()
+  let i = text.search(/\S/)
+  if (i < 0) return tags
+  while (i < text.length) {
+    argsToEnd.lastIndex = i
+    oneTag.lastIndex = i
+    let tag: string
+    let body: string
+    let end: number
+    const toEnd = argsToEnd.exec(text)
+    if (toEnd !== null) {
+      tag = 'command-args'
+      body = toEnd[1] ?? ''
+      end = text.length
+    } else {
+      const m = oneTag.exec(text)
+      if (m === null) return null
+      tag = m[1] ?? ''
+      body = m[2] ?? ''
+      end = i + m[0].length
+    }
+    if (!COMMAND_TAGS.includes(tag) || tags.has(tag)) return null
+    tags.set(tag, body)
+    i = end
+    while (i < text.length && /\s/.test(text.charAt(i))) i++
+  }
+
+  return tags
+}
+
+/**
+ * True for a command row the engine draws as its own `> /name args` line: that component opens no render site, so the row
+ * can never draw a turn's header (nor be hidden). The engine's rule: the text is only the command tags, its message names
+ * the command, it has no contents, and a skill-format row has no arguments.
+ */
+export function isPlainCommandLine(row: AppendRow): boolean {
+  if (!isCommandEcho(row)) return false
+  const texts = row.blocks.filter(b => b.type === 'text' && typeof b.text === 'string')
+  const text = texts.length === 1 ? texts[0]?.text : undefined
+  if (text === undefined) return false
+  const tags = commandTagsOf(text)
+  if (tags === null) return false
+  const name = (tags.get('command-name') ?? '').trim()
+  if (name === '') return false
+  const skillFormat = tags.get('skill-format')
+  if (skillFormat !== undefined && skillFormat !== 'true') return false
+  const message = (tags.get('command-message') ?? '').trim()
+  if (message === '' || (message !== name && '/' + message !== name)) return false
+  if (tags.has('command-contents')) return false
+
+  return !(skillFormat !== undefined && (tags.get('command-args') ?? '').trim() !== '')
+}
+
 /** The text blocks of a row joined, or null when it has none. */
 function textOf(row: AppendRow): string | null {
   const parts = row.blocks.filter(b => b.type === 'text' && typeof b.text === 'string').map(b => b.text)
@@ -289,8 +377,9 @@ function moveCloser(t: Tracker, turnId: string, row: AppendRow): string | null {
 /**
  * Files one appended row. While a turn runs its rows belong to it; while idle a starter (or command) row starts the
  * `pending` group the next turn adopts, and the tail rows after an end (the duration notice, the interrupt notice) belong
- * to the turn that ended, until its duration notice has come. The header is the turn's starter row; a turn that has none
- * takes its first reply (or tool call) instead. Mutates `t`.
+ * to the turn that ended, until its duration notice has come. The header is the turn's starter row (never a command line
+ * the engine draws as `> /name args`, nor the expanded text beside it); a turn that has none takes its
+ * first reply (or tool call) instead. Mutates `t`.
  */
 export function onAppend(t: Tracker, row: AppendRow): Appended {
   if (row.door === 'queue' || row.door === 'compaction') return { ...NOTHING }
@@ -313,6 +402,17 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       t.runningHeader = header
       t.headers.set(t.running, header)
     }
+    // A turn that started before its rows: the person's command row, if it comes before any reply or other starter, gives
+    // it its title (the header is the first row the engine draws through a site).
+    if (t.runningUntitled) {
+      if (isCommandEcho(row)) {
+        const title = commandTitleOf(row)
+        if (title !== null) t.lateCommands.set(t.running, title)
+        t.runningUntitled = false
+      } else if (row.door === 'response' || (isStarter(row) && !isCompanion(row))) {
+        t.runningUntitled = false
+      }
+    }
     rememberIds(t, t.running, ids)
 
     return { assign: ids, to: t.running, closer: moveCloser(t, t.running, row) }
@@ -326,14 +426,17 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       t.pending = {
         kind,
         ids: idsOf(row),
-        header: rowKeyOf(row.uuid),
+        header: headerIdOf(row),
         command: null,
         closer: closerOf(row),
         text: textOf(row),
         startKind: startKindOf(row),
+        ...(isCompanion(row) ? { companion: true as const } : {}),
       }
     } else {
-      // Another starter joins the group: its header and title stay.
+      // Another starter joins the group: its title stays, and it is the header only when the group has none yet (a command
+      // line or an expanded text, which draw none).
+      p.header ??= headerIdOf(row)
       p.ids.push(...idsOf(row))
       p.closer = applyCloser(p.closer, closerOf(row))
     }
@@ -357,6 +460,19 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
     } else if (local && t.pending.kind !== 'command') {
       // A local command's output while a prompt waits: no part of the turn that prompt starts.
       return { ...NOTHING }
+    } else if (t.pending.companion === true && isCommandEcho(row)) {
+      // The person's command row after the expanded text the engine wrote beside it (a skill, a prompt command): it gives the
+      // group its title and kind, as when it comes first (a command line the engine draws itself is no header: the first reply
+      // takes it); the expanded text stays in the group.
+      t.pending = {
+        kind: 'command',
+        ids: [...t.pending.ids, ...idsOf(row)],
+        header: headerIdOf(row),
+        command: commandTitleOf(row),
+        closer: applyCloser(t.pending.closer, closerOf(row)),
+        text: null,
+        startKind: 'other',
+      }
     } else {
       t.pending.ids.push(...idsOf(row))
       t.pending.header ??= headerIdOf(row)
@@ -414,6 +530,7 @@ export function onTurnStart(
   }
   t.running = turnId
   t.runningHeader = result.header
+  t.runningUntitled = pending === null || pending.companion === true
   if (result.header !== null) t.headers.set(turnId, result.header)
   if (pending !== null && pending.closer !== null) t.closers.set(turnId, pending.closer)
   rememberIds(t, turnId, result.assign)
@@ -438,5 +555,6 @@ export function onTurnComplete(t: Tracker, turnId: string): void {
   if (t.running === turnId) {
     t.running = null
     t.runningHeader = null
+    t.runningUntitled = false
   }
 }

@@ -375,6 +375,76 @@ test('a notification turn folds onto the notification line', boxedStill, async (
   expect(folded).toContain('#1')
 })
 
+const SKILL = 'Base directory for this skill: C:\\skills\\iwo'
+const SKILL_COMMAND =
+  '<command-message>iwo</command-message>\n<command-name>/iwo</command-name>\n<command-args>balanced fix it</command-args>'
+
+// The engine draws the person's command line (`> /iwo balanced fix it`) itself, through no render site: it is never mounted.
+test('a skill whose expanded text is appended before its command row folds onto its first reply', boxedStill, async ($, on) => {
+  const w = world(on)
+  await append($, 's1', 'prompt', 'user', say(SKILL), undefined, true, 'unclassified')
+  await append($, 'c1', 'command', 'user', say(SKILL_COMMAND))
+  await $.turn.start({ text: SKILL, turnId: 't1' } as never)
+  await attach($, 1)
+  await append($, 'b1', 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b1')
+  await Promise.all([$.turn.complete(answerOf('t1')), append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
+  const d = await duration($, 'd1', 4000)
+  await w.clock.advance(1000)
+  await liveTurn($, w, 2)
+  await w.clock.advance(3000)
+  const folded = await fullText(b)
+  expect(folded).toMatch(/▸ #1/)
+  expect(folded).toContain('/iwo balanced fix it')
+  expect(folded).not.toContain('Base directory')
+  await expectHidden(d)
+  expect(w.logs).toContain('claudefolder: turn.start 1 t1 header=none start=other adopted=2')
+  expect(w.logs).toContain('claudefolder: turn.complete 1 header=b1 closer=d1 status=done')
+})
+
+test('the command row first, then its expanded text (the usual order): the turn folds onto its first reply', boxedStill, async ($, on) => {
+  const w = world(on)
+  await append($, 'c1', 'command', 'user', say(SKILL_COMMAND))
+  await append($, 's1', 'prompt', 'user', say(SKILL), undefined, true, 'unclassified')
+  await $.turn.start({ text: SKILL, turnId: 't1' } as never)
+  await attach($, 1)
+  await append($, 'b1', 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b1')
+  await Promise.all([$.turn.complete(answerOf('t1')), append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
+  const d = await duration($, 'd1', 4000)
+  await w.clock.advance(1000)
+  await liveTurn($, w, 2)
+  await w.clock.advance(3000)
+  const folded = await fullText(b)
+  expect(folded).toMatch(/▸ #1/)
+  expect(folded).toContain('/iwo balanced fix it')
+  expect(folded).not.toContain('Base directory')
+  await expectHidden(d)
+  expect(w.logs).toContain('claudefolder: turn.start 1 t1 header=none start=other adopted=2')
+  expect(w.logs).toContain('claudefolder: turn.complete 1 header=b1 closer=d1 status=done')
+})
+
+test("the turn starts before the skill's rows: the turn folds onto its first reply, titled with the command", boxedStill, async ($, on) => {
+  const w = world(on)
+  await $.turn.start({ text: SKILL, turnId: 't1' } as never)
+  await append($, 's1', 'prompt', 'user', say(SKILL), undefined, true, 'unclassified')
+  await append($, 'c1', 'command', 'user', say(SKILL_COMMAND))
+  await attach($, 1)
+  await append($, 'b1', 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b1')
+  await Promise.all([$.turn.complete(answerOf('t1')), append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
+  const d = await duration($, 'd1', 4000)
+  await w.clock.advance(1000)
+  await liveTurn($, w, 2)
+  await w.clock.advance(3000)
+  const folded = await fullText(b)
+  expect(folded).toMatch(/▸ #1/)
+  expect(folded).toContain('/iwo balanced fix it')
+  expect(folded).not.toContain('Base directory')
+  await expectHidden(d)
+  expect(w.logs).toContain('claudefolder: turn.complete 1 header=b1 closer=d1 status=done')
+})
+
 test('a header that never draws: the turn never vanishes', boxedStill, async ($, on) => {
   const w = world(on)
   // A meta starter that nobody mounts: the turn's header row never draws.
