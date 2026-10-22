@@ -8,4 +8,5 @@ Effects to plan as a future round (after v8d). Glyph or colour choices get previ
 - [ ] **Age fade** — older folded turns gently dim, so recent ones pop.
 - [ ] **Focus mode** — `/folder focus` folds every turn except the current one, and keeps doing so as each new turn starts (the new one opens, the previous folds). `/folder focus off` returns to normal folding.
 - [ ] **Fold all on new turn** — a /config option: when a new turn starts, every preceding turn folds automatically, including turns the user opened manually (today a manually opened turn stays open at the next prompt).
+- [ ] **No shimmer on open turns** — remove the outline light (hover lap and open lap) from open turns' headers; only folded cards get the shimmer.
 - [ ] **Running header** — while a turn works, its open header's top line breathes slowly; when it finishes it settles with one lap, so "done" is visible from the corner of the eye.
