@@ -33,7 +33,11 @@ function world(on: On) {
   })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  on('tool.call', () => ({ result: 'ok' }) as never)
+  on('tool.call', (_$, e) => {
+    const call = e as unknown as { tool?: string; tool_use_id?: string }
+
+    return { result: call.tool === 'Agent' ? { status: 'async_launched', isAsync: true, agentId: 'agent-' + String(call.tool_use_id) } : 'ok' } as never
+  })
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('ui.render', ({ ui }, e) => {
     const { Text } = ui.resolve(e)
@@ -280,6 +284,19 @@ async function runTurn($: Engine, i: number, o: TurnOptions = {}) {
   if (o.noDuration !== true) await append($, 'd' + i, 'notice', 'system', [{ type: 'text', text: 'Baked for 41s' }], undefined, 'turn_duration')
 }
 
+/** Turn `i` launches one background agent (`agent-toolu_bg<i>`) and ends on its reply `b<i>` and duration line `d<i>`. */
+async function runAgentTurn($: Engine, i: number) {
+  const turnId = 't' + i
+  await append($, 'u' + i, 'prompt', 'user', [{ type: 'text', text: 'start an agent' }])
+  await $.turn.start({ text: 'start an agent', turnId } as never)
+  await append($, 'a' + i, 'response', 'assistant', [{ type: 'tool_use', id: 'toolu_bg' + i, name: 'Agent', input: {} }])
+  await $.tool.call({ tool: 'Agent', tool_use_id: 'toolu_bg' + i, description: 'x', prompt: 'y' } as never)
+  await append($, 'r' + i, 'tool-result', 'user', [{ type: 'tool_result', tool_use_id: 'toolu_bg' + i, content: 'ok' }])
+  await append($, 'b' + i, 'response', 'assistant', [{ type: 'text', text: 'Started.' }])
+  await $.turn.complete({ answer: 'Started.', durationMs: 3000, isAborted: false, turnId, reason: 'answer' } as never)
+  await append($, 'd' + i, 'notice', 'system', [{ type: 'text', text: 'Baked for 3s' }], undefined, 'turn_duration')
+}
+
 type Viewport = { columns: number; rows: number; isFullscreen?: boolean }
 
 const user = ($: Engine, requestId: string, props: Record<string, unknown> = {}, viewport: Viewport = VIEWPORT) =>
@@ -336,13 +353,13 @@ const group = ($: Engine, requestId: string, callIds: string[]) =>
     viewport: VIEWPORT,
   })
 
-const duration = ($: Engine, requestId: string, durationMs: number) =>
+const duration = ($: Engine, requestId: string, durationMs: number, props: Record<string, unknown> = {}) =>
   $.ui.mount({
     plugin: 'claudefolder',
     surface: 'terminal',
     component: 'TurnDuration',
     requestId,
-    props: { word: 'Baked', durationMs } as never,
+    props: { word: 'Baked', durationMs, ...props } as never,
     viewport: VIEWPORT,
   })
 
@@ -1589,6 +1606,84 @@ test("a meta row between the prompt and the turn does not take the prompt's plac
   expect(clients(framedM)).toEqual([])
 })
 
+// ---- background agents: duration lines the engine leaves out, and notification titles ------------
+
+/** The text a task notification row of agent `agent` holds. */
+const notificationOf = (agent: string, summary: string): string =>
+  '<task-notification>\n<task-id>' + agent + '</task-id>\n<status>completed</status>\n<summary>' + summary + '</summary>\n</task-notification>'
+
+test('boxed: a hand-back turn whose duration line the engine leaves out closes its card under its reply', boxedStill, async ($, on) => {
+  const w = world(on)
+  await runAgentTurn($, 1)
+  await append($, 'h2', 'prompt', 'user', [{ type: 'text', text: 'Another Claude session sent a message' }], undefined, undefined, true, 'peer')
+  await $.turn.start({ text: '', turnId: 't2' } as never)
+  await append($, 'b2', 'response', 'assistant', [{ type: 'text', text: 'Done.' }])
+  await $.turn.complete({ answer: 'Done.', durationMs: 3000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await append($, 'd2', 'notice', 'system', [{ type: 'text', text: 'Baked for 3s' }], undefined, 'turn_duration')
+  await append($, 'n3', 'prompt', 'user', [{ type: 'text', text: notificationOf('agent-toolu_bg1', 'Agent "x" finished') }], undefined, undefined, false, 'task-notification')
+  const h2 = await user($, 'h2', { from: { name: 'general-purpose' } })
+  const b2 = await assistant($, 'b2')
+  const d2 = await duration($, 'd2', 3_000)
+  const n3 = await user($, 'n3', { origin: { kind: 'task-notification' }, task: { id: 'agent-toolu_bg1', status: 'completed' } })
+  await w.clock.advance(1)
+  for (const ui of [h2, b2, d2, n3]) await ui.redraw()
+  expect((await fullText(h2)).startsWith('╭─ ▾ #2')).toBe(true)
+  const closed = await b2.drawn()
+  expect(textOf(closed)).toBe(ENGINE + cardBottom)
+  expect(walk(closed).filter(n => n.props?.position === 'absolute').length).toBe(2)
+  const plainD = await d2.drawn()
+  expect(textOf(plainD)).toBe(ENGINE)
+  expect(walk(plainD).filter(n => n.props?.position === 'absolute').length).toBe(0)
+  const plainN = await n3.drawn()
+  expect(textOf(plainN)).toBe(ENGINE)
+  expect(walk(plainN).filter(n => n.props?.position === 'absolute').length).toBe(0)
+  expect(w.logs).toContain('claudefolder: turn.complete 2 header=h2 closer=b2 status=done')
+})
+
+test('a turn started by a task notification is titled by its summary, never by the tag', still, async ($, on) => {
+  const w = world(on)
+  const body = notificationOf('agent-toolu_bg1', 'Agent "Quick test agent" finished')
+  await runAgentTurn($, 1)
+  await append($, 'n2', 'prompt', 'user', [{ type: 'text', text: body }], undefined, undefined, false, 'task-notification')
+  await $.turn.start({ text: body, turnId: 't2' } as never)
+  await append($, 'b2', 'response', 'assistant', [{ type: 'text', text: 'Noted.' }])
+  await $.turn.complete({ answer: 'Noted.', durationMs: 2000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await append($, 'd2', 'notice', 'system', [{ type: 'text', text: 'Baked for 2s' }], undefined, 'turn_duration')
+  const saved = w.writes.filter(x => x.key === 'turn' && (x.value as { turnId?: string }).turnId === 't2')
+  expect((saved[saved.length - 1]?.value as { title?: string }).title).toBe('Agent "Quick test agent" finished')
+  await runTurn($, 3)
+  const n2 = await user($, 'n2', {
+    text: 'Agent "Quick test agent" finished',
+    origin: { kind: 'task-notification' },
+    task: { id: 'agent-toolu_bg1' },
+  })
+  await w.clock.advance(1)
+  const drawn = await fullText(n2)
+  expect(drawn).toContain('Agent "Quick test agent" finished')
+  expect(drawn.includes('<task-notification>')).toBe(false)
+})
+
+test('boxed: a typed prompt after a waiting notification: the notification draws as the engine does, outside the new card', boxedStill, async ($, on) => {
+  const w = world(on)
+  await runAgentTurn($, 1)
+  await append($, 'n2', 'prompt', 'user', [{ type: 'text', text: notificationOf('agent-toolu_bg1', 'Agent "x" finished') }], undefined, undefined, false, 'task-notification')
+  await append($, 'u2', 'prompt', 'user', [{ type: 'text', text: 'and now?' }])
+  await $.turn.start({ text: 'and now?', turnId: 't2' } as never)
+  await append($, 'b2', 'response', 'assistant', [{ type: 'text', text: 'Fine.' }])
+  await $.turn.complete({ answer: 'Fine.', durationMs: 41_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await append($, 'd2', 'notice', 'system', [{ type: 'text', text: 'Baked for 41s' }], undefined, 'turn_duration')
+  const u2 = await user($, 'u2')
+  const n2 = await user($, 'n2', { task: { id: 'agent-toolu_bg1' } })
+  const d2 = await duration($, 'd2', 41_000)
+  await w.clock.advance(1)
+  for (const ui of [u2, n2, d2]) await ui.redraw()
+  expect((await fullText(u2)).startsWith('╭─ ▾ #2')).toBe(true)
+  const plainN = await n2.drawn()
+  expect(textOf(plainN)).toBe(ENGINE)
+  expect(walk(plainN).filter(n => n.props?.position === 'absolute').length).toBe(0)
+  expect(textOf(await d2.drawn())).toBe(ENGINE + cardBottom)
+})
+
 // ---- rows after the duration line are not part of the turn -------------------------------------
 
 /** A notice or a log line the engine draws as command output. */
@@ -1715,6 +1810,95 @@ test("boxed, lively: hovering an open header's ▾ #1 runs the header's own ligh
   await leave(u1, head(1))
   expect(await rowRuns(u1, head(1), 0)).toEqual(rest)
   expect(w.writes.length).toBe(written)
+})
+
+// ---- the bars start at the row's first line on screen ---------------------------------------------
+
+/** The absolutely placed boxes of a drawn tree: an open card's two sides, or the rail's one bar. */
+const barsOf = (node: unknown): Node[] => walk(node).filter(n => n.props?.position === 'absolute')
+
+/** What the engine reports of a row: `first` of its `of` rows scrolled away above the viewport. */
+const seen = (first: number, of: number) => ({ onScreen: { first, last: of - 1, of } })
+
+test('boxed: a row partly scrolled above the viewport starts its sides at its first line on screen', boxedStill, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  // The duration line moves the closer with a write the notice starts and nobody awaits: let it land before the first draw.
+  await w.clock.advance(1)
+  await w.clock.settle()
+  const b1 = await assistant($, 'b1', seen(3, 10))
+  const drawn = await b1.drawn()
+  expect(barsOf(drawn).map(n => n.props?.left)).toEqual([0, 97])
+  expect(barsOf(drawn).map(n => n.props?.top)).toEqual([3, 3])
+  expect(barsOf(drawn).map(n => n.props?.bottom)).toEqual([0, 0])
+  expect(textOf(drawn)).toBe(ENGINE)
+  expect(concealers(drawn)).toEqual([])
+  // Not reported yet (the first draw): from the top.
+  await b1.redraw({ text: 'Fixed it.', isFirstOfReply: true } as never)
+  expect(barsOf(await b1.drawn()).map(n => n.props?.top)).toEqual([0, 0])
+  // Drawn outside the viewport: no bar, and the row keeps its place inside the card.
+  await b1.redraw({ text: 'Fixed it.', isFirstOfReply: true, onScreen: null } as never)
+  const outside = await b1.drawn()
+  expect(barsOf(outside)).toEqual([])
+  expect(textOf(outside)).toBe(ENGINE)
+  const frame = walk(outside).find(n => n.props?.marginRight === 2 && n.props?.paddingLeft === 2 && n.props?.paddingRight === 2)
+  expect(frame).toBeDefined()
+})
+
+test('boxed: the duration line starts its sides at its first line on screen, and draws none when only the bottom border is on screen', boxedStill, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  // The duration line moves the closer with a write the notice starts and nobody awaits: let it land before the first draw.
+  await w.clock.advance(1)
+  await w.clock.settle()
+  const d1 = await duration($, 'd1', 41_000, seen(2, 4))
+  const drawn = await d1.drawn()
+  expect(barsOf(drawn).map(n => n.props?.top)).toEqual([2, 2])
+  expect(textOf(drawn)).toBe(ENGINE + cardBottom)
+  await d1.redraw({ word: 'Baked', durationMs: 41_000, ...seen(3, 4) } as never)
+  const border = await d1.drawn()
+  expect(barsOf(border)).toEqual([])
+  expect(textOf(border)).toBe(ENGINE + cardBottom)
+})
+
+test('boxed: the open header row starts the sides of its engine part below its top line', boxedStill, async ($, on) => {
+  world(on)
+  await runTurn($, 1)
+  const u1 = await user($, 'u1', seen(0, 12))
+  expect(barsOf(await u1.drawn()).map(n => n.props?.top)).toEqual([0, 0])
+  expect(await fullText(u1)).toBe(TEST_TOP + ENGINE)
+  await u1.redraw({ text: 'x', origin: { kind: 'composer' }, isExpanded: false, ...seen(4, 12) } as never)
+  expect(barsOf(await u1.drawn()).map(n => n.props?.top)).toEqual([3, 3])
+})
+
+test('rail: a row and the open header row start the bar at their first line on screen', still, async ($, on) => {
+  world(on)
+  await runTurn($, 1)
+  const drawn = await (await assistant($, 'b1', seen(2, 6))).drawn()
+  expect(barsOf(drawn).length).toBe(1)
+  expect(barsOf(drawn)[0]?.props?.top).toBe(2)
+  expect(textOf(railOf(drawn))).toBe(railText('▌'))
+  const u1 = await user($, 'u1', seen(5, 20))
+  const header = await u1.drawn()
+  expect(barsOf(header).length).toBe(1)
+  expect(barsOf(header)[0]?.props?.top).toBe(3)
+  expect(gapOf(header)).toBeDefined()
+  await u1.redraw({ text: 'x', origin: { kind: 'composer' }, isExpanded: false, ...seen(1, 20) } as never)
+  expect(barsOf(await u1.drawn())[0]?.props?.top).toBe(0)
+})
+
+test('boxed: a scroll that moves a row past the top redraws its sides only: no state write and no invalidate', boxedStill, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  const b1 = await assistant($, 'b1', seen(0, 10))
+  await w.clock.advance(2000)
+  await w.clock.settle()
+  const writes = w.writes.length
+  const logs = w.logs.length
+  await b1.redraw({ text: 'Fixed it.', isFirstOfReply: true, ...seen(6, 10) } as never)
+  expect(barsOf(await b1.drawn()).map(n => n.props?.top)).toEqual([6, 6])
+  expect(w.writes.length).toBe(writes)
+  expect(w.logs.slice(logs).some(l => l.startsWith('claudefolder: invalidate'))).toBe(false)
 })
 
 // ---- three folded lines ----------------------------------------------------------------------

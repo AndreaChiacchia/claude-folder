@@ -9,8 +9,8 @@ import type { HeaderModel } from './header'
 import { FOLD_DELAY_MS, FRAME_MS, LEVELS, composeRows, composeText, createMotion, lineCells, textRuns } from './motion'
 import type { TextCell } from './motion'
 import { DEFAULT_SETTINGS, normalizeSettings } from './settings'
-import { fileOf, replyOf, stripTags, titleOf } from './summary'
-import { MAX_ROW_IDS, createTracker, onAppend, onTurnComplete, onTurnStart, resumeLast, rowKeyOf } from './tracker'
+import { fileOf, notificationTitleOf, replyOf, stripTags, titleOf } from './summary'
+import { MAX_ROW_IDS, createTracker, onAgentLaunched, onAppend, onTurnComplete, onTurnStart, resumeLast, rowKeyOf } from './tracker'
 import type { Appended, AppendRow, Block, Tracker } from './tracker'
 
 /** The width assumed when the surface has not measured. */
@@ -52,6 +52,8 @@ const USAGE_TEXT =
 
 /** The mod's state references are written inline at each call: the plugin and key stay literals in source; only the id is computed. */
 const order = atom({ plugin: 'claudefolder', key: 'order' } as const, [])
+/** The background agents the tracker follows (`Tracker.agents`, `Tracker.lastPending`), so a reload goes on counting them. */
+const agentsAtom = atom({ plugin: 'claudefolder', key: 'agents' } as const, { pending: [], last: 0 })
 
 /** The /config settings, read in `register`: a module variable, so /clear and /resume keep them; a /config change reloads the module. */
 let settings: Settings = DEFAULT_SETTINGS
@@ -241,6 +243,25 @@ function edgeText(): string {
   return cardEdgeText
 }
 
+/**
+ * Where the side bars (or the rail bar) of a row's framed part start, in rows from that part's top, or null to draw none.
+ * `onScreen` is the row's own report: its rows scrolled away above the viewport (`first`) and its whole height (`of`), its
+ * tree's rows counted; `before` is how many rows of the tree come above the framed part (an open header's lines), `after`
+ * how many below it (the card's bottom border). The engine draws an absolutely placed Box whose top would be above the
+ * screen at the screen's top row with its full height, so a bar that began above the screen would run past its row onto
+ * the rows below: started at the first row on screen, it never does. Not reported yet (the first draw): from the top, as
+ * the engine reports the row right after; drawn outside the viewport: none.
+ */
+function barStart(onScreen: RowProps['onScreen'], before: number, after: number): number | null {
+  if (onScreen === undefined) return 0
+  if (onScreen === null) return null
+  if (typeof onScreen.first !== 'number' || !Number.isFinite(onScreen.first)) return 0
+  const top = Math.max(0, Math.floor(onScreen.first) - before)
+  if (typeof onScreen.of === 'number' && Number.isFinite(onScreen.of) && top >= onScreen.of - before - after) return null
+
+  return top
+}
+
 /** Thrown inside `update` to write nothing: the turn is unknown, or the change leaves it as it is. */
 const NO_CHANGE = new Error('claudefolder: no change')
 
@@ -343,6 +364,24 @@ async function turnIdOf($: EngineInterface, requestId: string, component: string
   }
 
   return undefined
+}
+
+/** The tracker's agent count as one comparable string. */
+const agentsKey = (t: Tracker): string => [...t.agents].join(',') + '|' + t.lastPending
+
+/** Keeps the tracker's agent count in the state, so a reload of the module goes on from it; never throws. */
+function saveAgents($: EngineInterface): void {
+  void $.state.set({ plugin: 'claudefolder', key: 'agents' } as const, { pending: [...tracker.agents], last: tracker.lastPending }).catch(() => undefined)
+}
+
+/** The id of the background agent an Agent or SendMessage call launched or resumed, from the tool's record; else null. */
+function launchedAgentOf(result: unknown): string | null {
+  if (result === null || typeof result !== 'object') return null
+  const r = result as Record<string, unknown>
+  if (r.status === 'async_launched' && typeof r.agentId === 'string') return r.agentId
+  if (typeof r.resumedAgentId === 'string') return r.resumedAgentId
+
+  return null
 }
 
 /** What `session.append` carries of a row, as far as the mod reads it. */
@@ -691,6 +730,10 @@ async function recover($: EngineInterface): Promise<void> {
         break
       }
     }
+    // A reload goes on counting the background agents (after a restart the state is empty, as the engine's agents are gone).
+    const kept = await read($, agentsAtom)
+    tracker.agents = new Set(kept.pending)
+    tracker.lastPending = kept.last
     // The tints follow the terminal's theme: the user's `theme` setting, dark when it is not a light one or cannot be read.
     try {
       palette = paletteFor(await $.settings.read({ key: 'theme' }))
@@ -725,9 +768,23 @@ function displayTitle(turn: FolderTurn, component: string, props: RowProps): str
   if (component !== 'UserMessage') return turn.title
   const name = props.from?.name
   if (turn.startKind === 'peer' && typeof name === 'string' && name.trim() !== '') return `Message from @${name.trim()}`
-  if (turn.startKind === 'notification' && typeof props.text === 'string' && props.text.trim() !== '') return titleOf(props.text, null)
+  // A notification row draws the engine's own words (`Agent "x" finished`): also for a turn saved before it had its kind.
+  const isNotice = turn.startKind === 'notification' || props.task !== undefined
+  if (isNotice && typeof props.text === 'string' && props.text.trim() !== '') return titleOf(props.text, null)
 
   return turn.title
+}
+
+/**
+ * A new turn's title: a task notification's summary; else a command's title, the turn's text as given, or (no text) its
+ * starter's words with their tags removed.
+ */
+function titleFor(text: string, starter: string | null, command: string | null): string {
+  const source = text.trim() !== '' ? text : (starter ?? '')
+  const notified = command === null ? notificationTitleOf(source) : null
+  if (notified !== null) return titleOf(notified, null)
+
+  return text.trim() !== '' ? titleOf(text, command) : titleOf(stripTags(starter ?? ''), command)
 }
 
 /** The finished turns, oldest first. */
@@ -871,7 +928,9 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return next(e)
     if (!recovered) await ensureRecovered($)
     const row = rowOf(e)
+    const agentsBefore = agentsKey(tracker)
     const res = onAppend(tracker, row)
+    if (agentsKey(tracker) !== agentsBefore) saveAgents($)
     const isRunning = res.to !== null && res.to === tracker.running
     $.ui.log(
       `claudefolder: append ${row.door} ${row.type}${row.isMeta ? ' meta' : ''}${row.name === undefined ? '' : ' ' + row.name}${row.origin === undefined ? '' : ' ' + row.origin} ${shortId(row.uuid)} -> ${whereOf(res, row)}`,
@@ -904,7 +963,7 @@ export const register: Register = (on, options) => {
       n: nextN++,
       turnId,
       // A turn with no typed prompt (a hand-back, a notification) takes its title from its starter row's words.
-      title: e.text.trim() !== '' ? titleOf(e.text, res.command) : titleOf(stripTags(res.text ?? ''), res.command),
+      title: titleFor(e.text, res.text, res.command),
       reply: '',
       tools: 0,
       files: [],
@@ -938,7 +997,7 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   // Each tool call of the main loop counts toward the running turn, and files its row. A pass-through: nothing awaited before `next`.
-  on('tool.call', ($, e, next) => {
+  on('tool.call', async ($, e, next) => {
     const running = tracker.running
     if (e.agentId === undefined && running !== null) {
       const c = counters.get(running)
@@ -954,8 +1013,17 @@ export const register: Register = (on, options) => {
         void $.state.set({ plugin: 'claudefolder', key: 'row', id: key } as const, running).catch(() => undefined)
       }
     }
+    const r = await next(e)
+    // A background agent the main loop launched or resumed: pending until its task notification (the duration rule).
+    if (e.agentId === undefined && (e.tool === 'Agent' || e.tool === 'SendMessage') && r.deny === undefined) {
+      const id = launchedAgentOf(r.result)
+      if (id !== null && !tracker.agents.has(id)) {
+        onAgentLaunched(tracker, id)
+        saveAgents($)
+      }
+    }
 
-    return next(e)
+    return r
   }).catch(($, e, next) => next(e))
 
   // A main-loop turn ends: its summary is written, and under `finish` it folds a moment later. Observes only.
@@ -1072,31 +1140,35 @@ export const register: Register = (on, options) => {
         closer !== null &&
         component !== 'ToolUse' &&
         (requestId === rowKeyOf(closer) || (component === 'ToolGroup' && (props.calls ?? []).some(c => c.tool_use_id !== undefined && rowKeyOf(c.tool_use_id) === rowKeyOf(closer))))
-      // The edge bar down a row of an open turn: an absolutely placed one-column Box the height of the row it wraps, clipped to it.
+      // The edge bar down a row of an open turn: an absolutely placed one-column Box the height of the row it wraps, clipped to it,
+      // starting at `top`, the row's first line on screen (`barStart`); null draws no bar.
       // Plain Text: the bar carries no hover and no light; only a header's text reacts to the pointer.
-      const railed = (node: Awaited<ReturnType<typeof next>>) => (
+      const railed = (node: Awaited<ReturnType<typeof next>>, top: number | null) => (
         <Box flexDirection="column" paddingLeft={2}>
           {node}
-          <Box position="absolute" top={0} bottom={0} left={0} width={1} overflow="hidden">
-            <Text color={hex(palette.rail)}>{railText(settings.edge)}</Text>
-          </Box>
+          {top === null ? null : (
+            <Box position="absolute" top={top} bottom={0} left={0} width={1} overflow="hidden">
+              <Text color={hex(palette.rail)}>{railText(settings.edge)}</Text>
+            </Box>
+          )}
         </Box>
       )
-      // The open card's side bar at column `x`: the same mechanism as the rail, in the card's color.
-      const sideBar = (x: number) => (
-        <Box position="absolute" top={0} bottom={0} left={x} width={1} overflow="hidden">
+      // The open card's side bar at column `x`, from row `top` down: the same mechanism as the rail, in the card's color.
+      const sideBar = (x: number, top: number) => (
+        <Box position="absolute" top={top} bottom={0} left={x} width={1} overflow="hidden">
           <Text color={hex(palette.frameOpen)}>{edgeText()}</Text>
         </Box>
       )
       // A row of an open boxed turn: its content two columns inside the card's sides; the closer row adds the card's bottom border.
       // No `width` here (nor display, overflow, position, height, min sizes or offsets): the engine refuses its own node under a Box
       // that sets one. The margin ends the box where the header's right corner ends, and the right side sits at that column.
-      const framed = (node: Awaited<ReturnType<typeof next>>, closes: boolean) => (
+      // The sides start at `top` (`barStart`); null draws none (the row is outside the viewport, or only its border is on screen).
+      const framed = (node: Awaited<ReturnType<typeof next>>, closes: boolean, top: number | null) => (
         <Box flexDirection="column">
           <Box flexDirection="column" marginRight={2} paddingLeft={2} paddingRight={2}>
             {node}
-            {sideBar(0)}
-            {sideBar(W - 1)}
+            {top === null ? null : sideBar(0, top)}
+            {top === null ? null : sideBar(W - 1, top)}
           </Box>
           {closes ? (
             <Text>
@@ -1111,8 +1183,10 @@ export const register: Register = (on, options) => {
       )
       if (!isHeader) {
         noteDraw($, component, requestId, turn.folded ? 'open-unseen' : isRail ? 'railed' : isBoxed ? 'framed' : 'plain')
-        if (isRail) return railed(await next(e))
-        if (isBoxed) return framed(await next(e), isCloser)
+        // The bars start at the row's first line on screen: the closer's bottom border is the one row of the tree below them.
+        const top = barStart(props.onScreen, 0, isBoxed && isCloser ? 1 : 0)
+        if (isRail) return railed(await next(e), top)
+        if (isBoxed) return framed(await next(e), isCloser, top)
 
         return next(e)
       }
@@ -1211,7 +1285,13 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           {headerTree}
-          {engine === null ? null : isRail ? railed(engine) : isBoxed ? framed(engine, isCloser) : engine}
+          {engine === null
+            ? null
+            : isRail
+              ? railed(engine, barStart(props.onScreen, model.rows.length + 1, 0))
+              : isBoxed
+                ? framed(engine, isCloser, barStart(props.onScreen, model.rows.length, isCloser ? 1 : 0))
+                : engine}
         </Box>
       )
     },

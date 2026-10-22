@@ -19,8 +19,8 @@ export type StartKind = 'typed' | 'peer' | 'notification' | 'other'
 /**
  * The rows appended while idle that wait for the next turn to start: its starter (or command), what came with it, the
  * row it closes under so far, the row that draws its header and, for a starter, its text. `kind` says what started it:
- * later starters join the group, a typed prompt takes the header of a group a meta row started and replaces a group a
- * command started.
+ * later starters join the group, a typed prompt replaces a group a meta row or a command started (those rows stay outside
+ * its card).
  */
 export type Pending = {
   kind: PendingKind
@@ -30,6 +30,8 @@ export type Pending = {
   closer: Closer | null
   text: string | null
   startKind: StartKind
+  /** True once the group holds a local command's output: that command starts no turn, so the next starter or command row starts a new group. */
+  local?: true
 }
 
 /** Which turn the rows being appended belong to. */
@@ -47,13 +49,27 @@ export type Tracker = {
   headers: Map<string, string>
   /** By turnId: the `rowKeyOf` key of every id filed under the turn (at most `MAX_ROW_IDS`), which the saved session keeps. */
   ids: Map<string, string[]>
+  /** The ids of the background agents launched (or resumed) and not yet reported by a task notification row. */
+  agents: Set<string>
+  /** How many were pending at the newest duration line; 0 again after a prompt the person typed. */
+  lastPending: number
 }
 
 /** The most row keys kept per turn. */
 export const MAX_ROW_IDS = 400
 
 export function createTracker(): Tracker {
-  return { running: null, last: null, runningHeader: null, pending: null, closers: new Map(), headers: new Map(), ids: new Map() }
+  return {
+    running: null,
+    last: null,
+    runningHeader: null,
+    pending: null,
+    closers: new Map(),
+    headers: new Map(),
+    ids: new Map(),
+    agents: new Set(),
+    lastPending: 0,
+  }
 }
 
 /**
@@ -104,9 +120,71 @@ export function isStarter(row: AppendRow): boolean {
   return row.type === 'attachment' && row.door === 'delivery' && (row.name === 'queued_command' || row.name === 'teammate_mailbox')
 }
 
-/** True for a prompt the person typed: a user row of the door `prompt` that is not meta. */
+/**
+ * True for a prompt the person typed: a user row of the door `prompt` that is not meta. A task notification is a user row of
+ * that door too, not meta, but the engine wrote it (origin `task-notification`): it starts its turn as a notification.
+ */
 export function isTyped(row: AppendRow): boolean {
-  return row.type === 'user' && row.door === 'prompt' && !row.isMeta
+  return row.type === 'user' && row.door === 'prompt' && !row.isMeta && row.origin !== 'task-notification'
+}
+
+/**
+ * True for a row the engine counts as the person's own when it decides whether to draw a duration line: a typed prompt
+ * (origin `composer`, or none), or a queued prompt of theirs delivered while a turn runs.
+ */
+export function isPersonPrompt(row: AppendRow): boolean {
+  const human = row.origin === undefined || row.origin === 'composer'
+  if (row.type === 'user' && row.door === 'prompt') return !row.isMeta && human
+
+  return row.type === 'attachment' && row.door === 'delivery' && row.name === 'queued_command' && !row.isMeta && human
+}
+
+/** The ids of the background agents a task notification row reports on (its `<task-id>` tags); none for any other row. */
+export function reportedAgents(row: AppendRow): string[] {
+  if (row.door !== 'prompt' && row.door !== 'delivery') return []
+  const ids: string[] = []
+  for (const b of row.blocks) {
+    if (b.type !== 'text' || typeof b.text !== 'string' || !b.text.includes('<task-notification>')) continue
+    for (const m of b.text.matchAll(/<task-id>\s*([^<\s]+)\s*<\/task-id>/g)) if (m[1] !== undefined) ids.push(m[1])
+  }
+
+  return ids
+}
+
+/** A background agent was launched or resumed (an Agent or SendMessage call answered so): pending until reported. Mutates `t`. */
+export function onAgentLaunched(t: Tracker, agentId: string): void {
+  t.agents.add(agentId)
+}
+
+/**
+ * Whether the engine leaves this duration line out of the transcript, noting the count for the next one. The engine draws no
+ * duration line whose pending background agents are as many as at the previous duration line (and more than none) with no
+ * prompt of the person's in between: a hand-back or a notification turn while agents still run. Mutates `t`.
+ */
+function durationHidden(t: Tracker): boolean {
+  const pending = t.agents.size
+  const hidden = pending > 0 && pending === t.lastPending
+  t.lastPending = pending
+
+  return hidden
+}
+
+/** The turn's card closes for good under the row it closes under now: its duration line will not be drawn. Mutates `t`. */
+function sealCloser(t: Tracker, turnId: string): void {
+  const c = t.closers.get(turnId)
+  if (c !== undefined && !c.sticky) t.closers.set(turnId, { id: c.id, sticky: true })
+}
+
+/**
+ * True for the output of a local slash command (`/cost`, `/config`, a plugin's `command.run` answer): the engine files it at
+ * the door `command`, as one `system` row named `local_command`, or (older rows) as a user row holding a
+ * `<local-command-stdout>` or `<local-command-stderr>` block. It is no part of any turn.
+ */
+export function isLocalCommandOutput(row: AppendRow): boolean {
+  if (row.door !== 'command') return false
+  if (row.type === 'system' && row.name === 'local_command') return true
+
+  return row.blocks.some(b => b.type === 'text' && typeof b.text === 'string' && /<local-command-(stdout|stderr)>/.test(b.text))
 }
 
 /** What a starter row says started its turn: a typed prompt, a peer's message, a notification (a delivery attachment or a task notification), else other. */
@@ -216,7 +294,19 @@ function moveCloser(t: Tracker, turnId: string, row: AppendRow): string | null {
  */
 export function onAppend(t: Tracker, row: AppendRow): Appended {
   if (row.door === 'queue' || row.door === 'compaction') return { ...NOTHING }
+  for (const id of reportedAgents(row)) t.agents.delete(id)
+  if (isPersonPrompt(row)) t.lastPending = 0
+  const isDuration = row.door === 'notice' && row.name === 'turn_duration'
+  // A duration line the engine will not draw closes nothing: the card closes under the row it closes under now.
+  const hidden = isDuration && durationHidden(t)
   if (t.running !== null) {
+    // A local command printed while the turn runs: its output, not the turn's.
+    if (isLocalCommandOutput(row)) return { ...NOTHING }
+    if (hidden) {
+      sealCloser(t, t.running)
+
+      return { ...NOTHING }
+    }
     const ids = idsOf(row)
     const header = headerIdOf(row)
     if (t.runningHeader === null && header !== null) {
@@ -230,8 +320,9 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
   if (isStarter(row)) {
     const kind: PendingKind = isTyped(row) ? 'typed' : 'meta'
     const p = t.pending
-    if (p === null || (kind === 'typed' && p.kind === 'command')) {
-      // A new group; a typed prompt also replaces a group a command started (that group never got a turn).
+    if (p === null || (kind === 'typed' && p.kind !== 'typed') || p.local === true) {
+      // A new group; a typed prompt also replaces a group a command or another starter began (those rows draw above the
+      // prompt, so they stay out of its card, as the engine draws them), and any starter replaces a local command's group.
       t.pending = {
         kind,
         ids: idsOf(row),
@@ -241,14 +332,6 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
         text: textOf(row),
         startKind: startKindOf(row),
       }
-    } else if (kind === 'typed' && p.kind === 'meta') {
-      // A typed prompt joins a group a meta row started and takes its header, title text and kind.
-      p.ids.push(...idsOf(row))
-      p.closer = applyCloser(p.closer, closerOf(row))
-      p.kind = 'typed'
-      p.header = rowKeyOf(row.uuid)
-      p.text = textOf(row)
-      p.startKind = 'typed'
     } else {
       // Another starter joins the group: its header and title stay.
       p.ids.push(...idsOf(row))
@@ -258,7 +341,9 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
     return { ...NOTHING }
   }
   if (row.door === 'command') {
-    if (t.pending === null) {
+    const local = isLocalCommandOutput(row)
+    if (t.pending === null || t.pending.local === true) {
+      // A new command group; one after a local command's output starts afresh (that command started no turn).
       t.pending = {
         kind: 'command',
         ids: idsOf(row),
@@ -267,15 +352,32 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
         closer: closerOf(row),
         text: null,
         startKind: 'other',
+        ...(local ? { local: true as const } : {}),
       }
+    } else if (local && t.pending.kind !== 'command') {
+      // A local command's output while a prompt waits: no part of the turn that prompt starts.
+      return { ...NOTHING }
     } else {
       t.pending.ids.push(...idsOf(row))
       t.pending.header ??= headerIdOf(row)
       t.pending.command ??= commandTitleOf(row)
       t.pending.closer = applyCloser(t.pending.closer, closerOf(row))
+      if (local) t.pending.local = true
     }
 
     return { ...NOTHING }
+  }
+  if (isDuration && t.last !== null) {
+    // A duration line belongs to the turn that ended, even when the next starter came first: never to a waiting group.
+    if (hidden) {
+      sealCloser(t, t.last)
+
+      return { ...NOTHING }
+    }
+    const ids = idsOf(row)
+    rememberIds(t, t.last, ids)
+
+    return { assign: ids, to: t.last, closer: moveCloser(t, t.last, row) }
   }
   if (t.pending !== null) {
     t.pending.ids.push(...idsOf(row))
@@ -284,9 +386,8 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
     return { ...NOTHING }
   }
   if (t.last !== null) {
-    // A later duration notice replaces the waiting one; once the duration line has come no other idle row joins the turn.
-    const isDuration = row.door === 'notice' && row.name === 'turn_duration'
-    if (!isDuration && t.closers.get(t.last)?.sticky === true) return { ...NOTHING }
+    // Once the duration line has come (or the card was sealed without one) no other idle row joins the turn.
+    if (t.closers.get(t.last)?.sticky === true) return { ...NOTHING }
 
     const ids = idsOf(row)
     rememberIds(t, t.last, ids)

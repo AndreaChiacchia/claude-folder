@@ -7,10 +7,15 @@ import {
   createTracker,
   headerIdOf,
   idsOf,
+  isLocalCommandOutput,
+  isPersonPrompt,
   isStarter,
+  isTyped,
+  onAgentLaunched,
   onAppend,
   onTurnComplete,
   onTurnStart,
+  reportedAgents,
   resumeLast,
   rowKeyOf,
   startKindOf,
@@ -34,6 +39,13 @@ const row = (uuid: string, door: string, type: string, blocks: Block[] = [], isM
 const NOTHING = { assign: [], to: null, closer: null }
 
 const plain = (id: string) => ({ id, sticky: false })
+
+const duration = (id: string) => row(id, 'notice', 'system', [], false, 'turn_duration')
+const notificationText = (agent: string, summary = 'Agent "x" finished') =>
+  '<task-notification>\n<task-id>' + agent + '</task-id>\n<status>completed</status>\n<summary>' + summary + '</summary>\n</task-notification>'
+const notification = (id: string, agent: string, summary = 'Agent "x" finished') =>
+  row(id, 'prompt', 'user', [text(notificationText(agent, summary))], false, undefined, 'task-notification')
+const handBack = (id: string) => row(id, 'prompt', 'user', [text('Another Claude session sent a message')], true, undefined, 'peer')
 
 test('a prompt waits as pending and the turn that starts adopts its rows and header', () => {
   const t = createTracker()
@@ -106,16 +118,16 @@ test("turn.start before the prompt's append: the prompt becomes the running head
   expect(t.headers.get('t1')).toBe('u1')
 })
 
-test('two meta starters: the first is the header; a typed prompt after them takes the header and both are adopted', () => {
+test('two meta starters: the first is the header; a typed prompt after them starts a group of its own', () => {
   const t = createTracker()
   expect(onAppend(t, row('m0', 'prompt', 'user', [text('reminder')], true))).toEqual(NOTHING)
   expect(t.pending).toEqual({ kind: 'meta', ids: ['m0'], header: 'm0', command: null, closer: plain('m0'), text: 'reminder', startKind: 'other' })
   onAppend(t, row('m1', 'delivery', 'user', [text('second')], true))
   expect(t.pending).toMatchObject({ kind: 'meta', ids: ['m0', 'm1'], header: 'm0', text: 'reminder' })
   onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
-  expect(t.pending).toMatchObject({ kind: 'typed', ids: ['m0', 'm1', 'u1'], header: 'u1', text: 'hi', startKind: 'typed' })
+  expect(t.pending).toMatchObject({ kind: 'typed', ids: ['u1'], header: 'u1', text: 'hi', startKind: 'typed' })
   const start = onTurnStart(t, 't1')
-  expect(start).toMatchObject({ assign: ['m0', 'm1', 'u1'], header: 'u1', startKind: 'typed' })
+  expect(start).toMatchObject({ assign: ['u1'], header: 'u1', startKind: 'typed' })
   expect(headerIdOf(row('m2', 'delivery', 'user', [text('x')], true))).toBe('m2')
 })
 
@@ -160,6 +172,7 @@ test('a command group a turn adopts gives the command title', () => {
     closer: plain('c2'),
     text: null,
     startKind: 'other',
+    local: true,
   })
   expect(onTurnStart(t, 't1')).toEqual({
     assign: ['c1', 'c2', 'c3'],
@@ -169,6 +182,78 @@ test('a command group a turn adopts gives the command title', () => {
     text: null,
     startKind: 'other',
   })
+})
+
+test('isLocalCommandOutput: a local_command system row or a stdout or stderr block at the door command, nothing else', () => {
+  expect(isLocalCommandOutput(row('c', 'command', 'system', [text('x')], false, 'local_command'))).toBe(true)
+  expect(isLocalCommandOutput(row('c', 'command', 'user', [text('<local-command-stdout>a</local-command-stdout>')]))).toBe(true)
+  expect(isLocalCommandOutput(row('c', 'command', 'user', [text('<local-command-stderr>b</local-command-stderr>')]))).toBe(true)
+  expect(isLocalCommandOutput(row('c', 'command', 'user', [text('<command-name>/cost</command-name>')]))).toBe(false)
+  expect(isLocalCommandOutput(row('c', 'notice', 'system', [text('x')], false, 'local_command'))).toBe(false)
+})
+
+test('a local command, then a hand-back: the hand-back starts a group of its own', () => {
+  const t = createTracker()
+  onAppend(
+    t,
+    row('c1', 'command', 'system', [
+      text('<command-name>/folder</command-name><command-args>close all</command-args><local-command-stdout>Folded 2 turns.</local-command-stdout>'),
+    ], false, 'local_command'),
+  )
+  expect(t.pending).toMatchObject({ kind: 'command', ids: ['c1'], local: true })
+  onAppend(t, row('h1', 'prompt', 'user', [text('Another Claude session sent a message')], true, undefined, 'peer'))
+  expect(t.pending).toEqual({
+    kind: 'meta',
+    ids: ['h1'],
+    header: 'h1',
+    command: null,
+    closer: plain('h1'),
+    text: 'Another Claude session sent a message',
+    startKind: 'peer',
+  })
+  expect(onTurnStart(t, 't1')).toMatchObject({ assign: ['h1'], header: 'h1', command: null, startKind: 'peer' })
+})
+
+test('a local command, then another command: the second command starts its own group', () => {
+  const t = createTracker()
+  onAppend(t, row('c1', 'command', 'user', [text('<command-name>/cost</command-name>')]))
+  onAppend(t, row('c2', 'command', 'user', [text('<local-command-stdout>$0.10</local-command-stdout>')]))
+  expect(t.pending?.local).toBe(true)
+  onAppend(t, row('c3', 'command', 'user', [text('<command-name>/review</command-name>')]))
+  expect(t.pending).toEqual({ kind: 'command', ids: ['c3'], header: 'c3', command: '/review', closer: plain('c3'), text: null, startKind: 'other' })
+})
+
+test('a local command printed while a turn runs is no part of it', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  expect(onAppend(t, row('c1', 'command', 'system', [text('x')], false, 'local_command'))).toEqual(NOTHING)
+  expect(t.ids.get('t1')).toEqual(['u1'])
+})
+
+test('a local command printed while a prompt waits does not join its group', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  expect(onAppend(t, row('c1', 'command', 'system', [text('x')], false, 'local_command'))).toEqual(NOTHING)
+  expect(t.pending?.ids).toEqual(['u1'])
+})
+
+test('a plugin notice while a group waits, while the turn runs and idle after the duration line is never a header or a closer', () => {
+  const notice = (id: string) => row(id, 'notice', 'system', [text('claudefolder: This mod reloaded after a change to its files.')], false, 'informational')
+  expect(headerIdOf(notice('n0'))).toBeNull()
+  expect(closerOf(notice('n0'))).toBeNull()
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onAppend(t, notice('n1'))
+  expect(t.pending).toMatchObject({ header: 'u1', closer: plain('u1') })
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(onAppend(t, notice('n2')).closer).toBeNull()
+  expect(t.closers.get('t1')).toEqual(plain('a1'))
+  expect(t.headers.get('t1')).toBe('u1')
+  onAppend(t, row('d1', 'notice', 'system', [], false, 'turn_duration'))
+  onTurnComplete(t, 't1')
+  expect(onAppend(t, notice('n3'))).toEqual(NOTHING)
 })
 
 test('compaction and queue rows are ignored, idle or running', () => {
@@ -344,7 +429,7 @@ test('a typed prompt replaces a group a command started, as built', () => {
   expect(t.pending).toMatchObject({ kind: 'typed', ids: ['u'], header: 'u', command: null })
 })
 
-test('a typed prompt joins a group a meta row started and takes the header: the meta row is adopted', () => {
+test('a typed prompt after a waiting meta row starts its own group: the meta row draws outside the card', () => {
   const t = createTracker()
   onAppend(t, row('m', 'delivery', 'user', [text('Message from @agent')], true, undefined, 'peer'))
   expect(t.pending?.kind).toBe('meta')
@@ -352,7 +437,7 @@ test('a typed prompt joins a group a meta row started and takes the header: the 
   onAppend(t, row('u', 'prompt', 'user', [text('hello')]))
   const start = onTurnStart(t, 't1')
   expect(start.header).toBe('u')
-  expect(start.assign).toEqual(['m', 'u'])
+  expect(start.assign).toEqual(['u'])
   expect(start.startKind).toBe('typed')
   expect(start.text).toBe('hello')
 })
@@ -443,6 +528,132 @@ test('the tracker keeps the row keys of each turn: adopted, running and tail row
   onAppend(t, row('b6d78f44-8266-4aaa-84e5-0041bd1ce1bd', 'prompt', 'user', [text('again')]))
   onTurnStart(t, 't2')
   expect(t.ids.get('t2')).toEqual(['b6d78f44-8266-4aaa-84e5'])
+})
+
+// ---- background agents: the engine leaves some duration lines out ---------------------------------
+
+test('a hand-back turn while its agent still runs: the engine draws no duration line, so the card closes under the reply', () => {
+  const t = createTracker()
+  onAppend(t, row('u59', 'prompt', 'user', [text('go')]))
+  onTurnStart(t, 't59')
+  onAppend(t, row('a59', 'response', 'assistant', [call('toolu_bg')]))
+  onAgentLaunched(t, 'agentA')
+  onAppend(t, row('r59', 'tool-result', 'user', [result('toolu_bg')]))
+  onAppend(t, row('b59', 'response', 'assistant', [text('Started.')]))
+  const d59 = onAppend(t, duration('d59'))
+  expect(d59.to).toBe('t59')
+  expect(d59.closer).toBe('d59')
+  expect(t.closers.get('t59')).toEqual({ id: 'd59', sticky: true })
+  onTurnComplete(t, 't59')
+
+  onAppend(t, handBack('h60'))
+  onTurnStart(t, 't60')
+  onAppend(t, row('b60', 'response', 'assistant', [text('Done.')]))
+  expect(onAppend(t, duration('d60'))).toEqual(NOTHING)
+  expect(t.closers.get('t60')).toEqual({ id: 'b60', sticky: true })
+  expect((t.ids.get('t60') ?? []).includes('d60')).toBe(false)
+  onTurnComplete(t, 't60')
+
+  expect(onAppend(t, notification('n61', 'agentA'))).toEqual(NOTHING)
+  expect(t.agents.size).toBe(0)
+  expect(t.pending).toMatchObject({ kind: 'meta', header: 'n61', startKind: 'notification' })
+  expect(t.closers.get('t60')).toEqual({ id: 'b60', sticky: true })
+})
+
+test('a notification turn that launches another agent: one pending before and after, no duration line, the card closes under the reply', () => {
+  const t = createTracker()
+  onAppend(t, row('u55', 'prompt', 'user', [text('go')]))
+  onTurnStart(t, 't55')
+  onAppend(t, row('a55', 'response', 'assistant', [call('toolu_a')]))
+  onAgentLaunched(t, 'agentA')
+  onAppend(t, row('r55', 'tool-result', 'user', [result('toolu_a')]))
+  onAppend(t, row('b55', 'response', 'assistant', [text('Started.')]))
+  expect(onAppend(t, duration('d55')).closer).toBe('d55')
+  onTurnComplete(t, 't55')
+
+  onAppend(t, notification('n56', 'agentA'))
+  onTurnStart(t, 't56')
+  onAppend(t, row('a56', 'response', 'assistant', [call('toolu_b')]))
+  onAgentLaunched(t, 'agentB')
+  onAppend(t, row('r56', 'tool-result', 'user', [result('toolu_b')]))
+  onAppend(t, row('b56', 'response', 'assistant', [text('Second started.')]))
+  expect(onAppend(t, duration('d56'))).toEqual(NOTHING)
+  expect(t.closers.get('t56')).toEqual({ id: 'b56', sticky: true })
+  onTurnComplete(t, 't56')
+
+  onAppend(t, notification('n57', 'agentB'))
+  onTurnStart(t, 't57')
+  onAppend(t, row('b57', 'response', 'assistant', [text('All done.')]))
+  expect(onAppend(t, duration('d57')).closer).toBe('d57')
+  expect(t.closers.get('t57')).toEqual({ id: 'd57', sticky: true })
+})
+
+test('a prompt the person typed resets the count: the next duration line closes the card', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('go')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [call('toolu_a')]))
+  onAgentLaunched(t, 'agentA')
+  onAppend(t, row('b1', 'response', 'assistant', [text('Started.')]))
+  expect(onAppend(t, duration('d1')).closer).toBe('d1')
+  onTurnComplete(t, 't1')
+
+  onAppend(t, row('u2', 'prompt', 'user', [text('and now?')]))
+  onTurnStart(t, 't2')
+  onAppend(t, row('b2', 'response', 'assistant', [text('Fine.')]))
+  expect(onAppend(t, duration('d2')).closer).toBe('d2')
+  expect(t.closers.get('t2')).toEqual({ id: 'd2', sticky: true })
+  expect(t.agents.size).toBe(1)
+})
+
+test('an agent resumed by SendMessage counts again until its next notification', () => {
+  const t = createTracker()
+  onAgentLaunched(t, 'agentA')
+  expect(t.agents.size).toBe(1)
+  onAppend(t, notification('n', 'agentA'))
+  expect(t.agents.size).toBe(0)
+  onAgentLaunched(t, 'agentA')
+  expect(t.agents.size).toBe(1)
+})
+
+test('a duration line that comes after the next starter still belongs to the turn that ended', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('b1', 'response', 'assistant', [text('Hello')]))
+  onTurnComplete(t, 't1')
+  onAppend(t, row('u2', 'prompt', 'user', [text('next')]))
+  const d = onAppend(t, duration('d1'))
+  expect(d.to).toBe('t1')
+  expect(t.pending?.ids).toEqual(['u2'])
+  expect(t.closers.get('t1')).toEqual({ id: 'd1', sticky: true })
+})
+
+test('a task notification starts its turn as a notification: not typed, its own kind and header', () => {
+  const t = createTracker()
+  const n = notification('n', 'a')
+  expect(isTyped(n)).toBe(false)
+  expect(startKindOf(n)).toBe('notification')
+  onAppend(t, n)
+  expect(t.pending).toMatchObject({ kind: 'meta', header: 'n', startKind: 'notification' })
+})
+
+test('reportedAgents reads every task-id of a task notification at the doors prompt and delivery, and nothing else', () => {
+  expect(reportedAgents(row('n', 'prompt', 'user', [text(notificationText('a') + notificationText('b'))]))).toEqual(['a', 'b'])
+  const delivered = row('q', 'delivery', 'attachment', [text(notificationText('c'))], false, 'queued_command', 'task-notification')
+  expect(reportedAgents(delivered)).toEqual(['c'])
+  expect(reportedAgents(row('x', 'queue', 'user', [text(notificationText('d'))]))).toEqual([])
+  expect(reportedAgents(row('u', 'prompt', 'user', [text('fix the login')]))).toEqual([])
+})
+
+test('isPersonPrompt: a typed prompt or a queued prompt of the person, never a notification, a hand-back or a tool result', () => {
+  expect(isPersonPrompt(row('u', 'prompt', 'user', [text('hi')], false, undefined, 'composer'))).toBe(true)
+  expect(isPersonPrompt(row('u', 'prompt', 'user', [text('hi')]))).toBe(true)
+  expect(isPersonPrompt(notification('n', 'a'))).toBe(false)
+  expect(isPersonPrompt(handBack('h'))).toBe(false)
+  expect(isPersonPrompt(row('r', 'tool-result', 'user', [result('x')]))).toBe(false)
+  expect(isPersonPrompt(row('q', 'delivery', 'attachment', [text('next')], false, 'queued_command', 'composer'))).toBe(true)
+  expect(isPersonPrompt(row('q', 'delivery', 'attachment', [text('next')], false, 'queued_command', 'task-notification'))).toBe(false)
 })
 
 test('the row keys kept per turn stop at 400', () => {

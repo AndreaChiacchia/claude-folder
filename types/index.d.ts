@@ -125,6 +125,8 @@ declare module 'claude-code' {
       row: StateFamily<string>
       /** The main-loop turnIds of this session, oldest first. */
       order: string[]
+      /** The background agents pending a task notification, and the count at the newest duration line: kept across a reload. */
+      agents: { pending: string[]; last: number }
     }
   }
 }

@@ -23,6 +23,18 @@ export function titleOf(text: string, command: string | null): string {
   return cutCodePoints(line.replace(/\s+/g, ' ').trim(), TEXT_MAX)
 }
 
+/**
+ * The words a turn started by a task notification is titled with: the notification's `<summary>`, else its text with the
+ * bookkeeping tags and every tag removed; null for text that holds no `<task-notification>`.
+ */
+export function notificationTitleOf(text: string): string | null {
+  if (!text.includes('<task-notification>')) return null
+  const summary = /<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1]
+  const words = stripTags(summary ?? text.replace(/<(task-id|tool-use-id|output-file|status|note)>[\s\S]*?<\/\1>/g, ' '))
+
+  return words === '' ? null : words
+}
+
 /** `text` with every `<...>` tag removed and the whitespace collapsed: a notification's markup gives way to its words. */
 export function stripTags(text: string): string {
   return text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()

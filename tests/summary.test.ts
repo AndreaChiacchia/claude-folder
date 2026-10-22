@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { displayWidth } from '../hooks/cells'
-import { cutTo, fileOf, formatDuration, replyOf, statsParts, stripTags, titleOf } from '../hooks/summary'
+import { cutTo, fileOf, formatDuration, notificationTitleOf, replyOf, statsParts, stripTags, titleOf } from '../hooks/summary'
 import type { FolderTurn } from '../types'
 
 const turn = (over: Partial<FolderTurn> = {}): FolderTurn => ({
@@ -36,6 +36,14 @@ test('stripTags removes the tags and collapses the whitespace', () => {
   expect(stripTags('<task-notification><summary>Agent done</summary></task-notification>')).toBe('Agent done')
   expect(stripTags('  a <b>c</b>\n d ')).toBe('a c d')
   expect(stripTags('<x/>')).toBe('')
+})
+
+test('notificationTitleOf reads the summary of a task notification, else its words, and null for other text', () => {
+  const full =
+    '<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>Agent "Quick test agent" finished</summary>\n</task-notification>'
+  expect(notificationTitleOf(full)).toBe('Agent "Quick test agent" finished')
+  expect(notificationTitleOf('<task-notification><task-id>a</task-id><status>completed</status>All done.</task-notification>')).toBe('All done.')
+  expect(notificationTitleOf('fix the login')).toBeNull()
 })
 
 test('titleOf cuts to 200 code points', () => {

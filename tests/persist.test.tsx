@@ -357,6 +357,28 @@ for (const [name, options, marks] of [
   })
 }
 
+test('restart (boxed): a restored open turn starts its sides at the row first line on screen', { options: { motion: 'off', style: 'boxed' } }, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  await runTurn($, 2)
+  await saved(w)
+  await restart($, w)
+  const tops = async (ui: Drawer): Promise<unknown[]> =>
+    walk(await ui.drawn())
+      .filter(n => n.props?.position === 'absolute')
+      .map(n => n.props?.top)
+  // The header draws first, and turn 2 is open.
+  await user($, 'u2')
+  // b2 is known only through the saved row keys.
+  const b2 = await assistant($, 'b2')
+  expect(await tops(b2)).toEqual([0, 0])
+  await b2.redraw({ text: 'Fixed it.', isFirstOfReply: true, onScreen: { first: 3, last: 8, of: 9 } } as never)
+  expect(await tops(b2)).toEqual([3, 3])
+  await b2.redraw({ text: 'Fixed it.', isFirstOfReply: true, onScreen: null } as never)
+  expect(await tops(b2)).toEqual([])
+  expect(textOf(await b2.drawn())).toBe(ENGINE)
+})
+
 test('restart: a turn that was running when the session stopped comes back interrupted', still, async ($, on) => {
   const w = world(on)
   await runTurn($, 1)
