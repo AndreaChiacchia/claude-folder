@@ -1663,7 +1663,7 @@ test('a turn started by a task notification is titled by its summary, never by t
   expect(drawn.includes('<task-notification>')).toBe(false)
 })
 
-test('boxed: a typed prompt after a waiting notification: the notification draws as the engine does, outside the new card', boxedStill, async ($, on) => {
+test('boxed: a typed prompt after a notification that started no turn: the notification joins the turn before and closes its card', boxedStill, async ($, on) => {
   const w = world(on)
   await runAgentTurn($, 1)
   await append($, 'n2', 'prompt', 'user', [{ type: 'text', text: notificationOf('agent-toolu_bg1', 'Agent "x" finished') }], undefined, undefined, false, 'task-notification')
@@ -1678,10 +1678,12 @@ test('boxed: a typed prompt after a waiting notification: the notification draws
   await w.clock.advance(1)
   for (const ui of [u2, n2, d2]) await ui.redraw()
   expect((await fullText(u2)).startsWith('╭─ ▾ #2')).toBe(true)
-  const plainN = await n2.drawn()
-  expect(textOf(plainN)).toBe(ENGINE)
-  expect(walk(plainN).filter(n => n.props?.position === 'absolute').length).toBe(0)
+  // Turn 1 folded at turn.start t2, and its header u1 is never mounted: its rows draw open-unseen, the notification closing the card.
+  const closedN = await n2.drawn()
+  expect(textOf(closedN)).toBe(ENGINE + cardBottom)
+  expect(walk(closedN).filter(n => n.props?.position === 'absolute').length).toBe(2)
   expect(textOf(await d2.drawn())).toBe(ENGINE + cardBottom)
+  expect(w.logs).toContain('claudefolder: append prompt user composer u2 -> pending typed, moved 1 to tail 1')
 })
 
 // ---- rows after the duration line are not part of the turn -------------------------------------

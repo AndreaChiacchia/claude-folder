@@ -20,7 +20,8 @@ export type StartKind = 'typed' | 'peer' | 'notification' | 'other'
  * The rows appended while idle that wait for the next turn to start: its starter (or command), what came with it, the
  * row it closes under so far, the row that draws its header and, for a starter, its text. `kind` says what started it:
  * later starters join the group, a typed prompt replaces a group a meta row or a command started (those rows stay outside
- * its card).
+ * its card), except a group a notification or a hand-back started, which started no turn: its rows join the turn before
+ * (`abandonNotices`).
  */
 export type Pending = {
   kind: PendingKind
@@ -34,6 +35,8 @@ export type Pending = {
   local?: true
   /** True while a companion row (`isCompanion`) started the group: the person's command row that comes after it gives the group its title and kind. */
   companion?: true
+  /** The key of the newest notification or hand-back of the group that came after the previous turn's card had closed: if the group starts no turn, that card closes under it. */
+  lateNotice?: string
 }
 
 /** Which turn the rows being appended belong to. */
@@ -374,12 +377,39 @@ function moveCloser(t: Tracker, turnId: string, row: AppendRow): string | null {
   return after.id !== before?.id ? after.id : null
 }
 
+/** True for a group a notification or a hand-back started. */
+function isNoticeGroup(p: Pending): boolean {
+  return p.kind === 'meta' && (p.startKind === 'notification' || p.startKind === 'peer')
+}
+
+/**
+ * The waiting group a notification or a hand-back started, once the person acts instead (a typed prompt, a command): the
+ * engine ran no turn for it, so its rows join the turn before, whose card now closes under the newest of them that came
+ * after it had closed. Mutates `t`.
+ */
+function abandonNotices(t: Tracker): Appended {
+  if (t.pending === null || t.last === null || !isNoticeGroup(t.pending)) return { ...NOTHING }
+  const p = t.pending
+  const last = t.last
+  t.pending = null
+  rememberIds(t, last, p.ids)
+  let closer: string | null = null
+  if (p.lateNotice !== undefined) {
+    const before = t.closers.get(last)
+    t.closers.set(last, { id: p.lateNotice, sticky: true })
+    if (before?.id !== p.lateNotice) closer = p.lateNotice
+  }
+
+  return { assign: [...p.ids], to: last, closer }
+}
+
 /**
  * Files one appended row. While a turn runs its rows belong to it; while idle a starter (or command) row starts the
  * `pending` group the next turn adopts, and the tail rows after an end (the duration notice, the interrupt notice) belong
  * to the turn that ended, until its duration notice has come. The header is the turn's starter row (never a command line
  * the engine draws as `> /name args`, nor the expanded text beside it); a turn that has none takes its
- * first reply (or tool call) instead. Mutates `t`.
+ * first reply (or tool call) instead. A notification or a hand-back that waits while idle and is followed by the person's
+ * prompt or command, not by a turn, joins the turn before it (`abandonNotices`). Mutates `t`.
  */
 export function onAppend(t: Tracker, row: AppendRow): Appended {
   if (row.door === 'queue' || row.door === 'compaction') return { ...NOTHING }
@@ -414,11 +444,22 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       }
     }
     rememberIds(t, t.running, ids)
+    // A notification or a hand-back after the turn's end was seen (its duration line, drawn or not) but before `turn.complete`
+    // reached the tracker: it starts no turn of its own, so the card closes under it, as for the same row arriving while idle.
+    const start = startKindOf(row)
+    if (t.closers.get(t.running)?.sticky === true && isStarter(row) && (start === 'notification' || start === 'peer')) {
+      const after = { id: rowKeyOf(row.uuid), sticky: true }
+      const before = t.closers.get(t.running)
+      t.closers.set(t.running, after)
+
+      return { assign: ids, to: t.running, closer: after.id !== before?.id ? after.id : null }
+    }
 
     return { assign: ids, to: t.running, closer: moveCloser(t, t.running, row) }
   }
   if (isStarter(row)) {
     const kind: PendingKind = isTyped(row) ? 'typed' : 'meta'
+    const moved = kind === 'typed' ? abandonNotices(t) : { ...NOTHING }
     const p = t.pending
     if (p === null || (kind === 'typed' && p.kind !== 'typed') || p.local === true) {
       // A new group; a typed prompt also replaces a group a command or another starter began (those rows draw above the
@@ -440,10 +481,23 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       p.ids.push(...idsOf(row))
       p.closer = applyCloser(p.closer, closerOf(row))
     }
+    // A notification or a hand-back after the previous turn's card closed: if no turn comes for it, that card closes under it.
+    const start = startKindOf(row)
+    if (
+      t.pending !== null &&
+      t.pending.kind === 'meta' &&
+      (start === 'notification' || start === 'peer') &&
+      t.last !== null &&
+      t.closers.get(t.last)?.sticky === true
+    ) {
+      t.pending.lateNotice = rowKeyOf(row.uuid)
+    }
 
-    return { ...NOTHING }
+    return moved
   }
   if (row.door === 'command') {
+    // The person's command instead of the turn a waiting notification would start: that notification started no turn.
+    const moved = isCommandEcho(row) ? abandonNotices(t) : { ...NOTHING }
     const local = isLocalCommandOutput(row)
     if (t.pending === null || t.pending.local === true) {
       // A new command group; one after a local command's output starts afresh (that command started no turn).
@@ -481,7 +535,7 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       if (local) t.pending.local = true
     }
 
-    return { ...NOTHING }
+    return moved
   }
   if (isDuration && t.last !== null) {
     // A duration line belongs to the turn that ended, even when the next starter came first: never to a waiting group.

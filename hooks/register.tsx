@@ -460,11 +460,15 @@ function noteDraw($: EngineInterface, component: string, requestId: string, outc
 
 /** Where `onAppend` put a row, for the debug line: its turn, a finished turn's tail, the pending group, or nowhere. */
 function whereOf(res: Appended, row: AppendRow): string {
-  if (res.to !== null) return (res.to === tracker.running ? 'turn ' : 'tail ') + (turnNumbers.get(res.to) ?? '?')
+  const own = rowKeyOf(row.uuid)
+  const to = res.to
+  const moved = to !== null && !res.assign.includes(own)
+  const where = to === null ? '' : (to === tracker.running ? 'turn ' : 'tail ') + (turnNumbers.get(to) ?? '?')
+  if (to !== null && !moved) return where
   const p = tracker.pending
-  if (p === null || !p.ids.includes(rowKeyOf(row.uuid))) return 'unassigned'
+  const base = p === null || !p.ids.includes(own) ? 'unassigned' : 'pending ' + p.kind
 
-  return 'pending ' + p.kind
+  return moved ? `${base}, moved ${res.assign.length} to ${where}` : base
 }
 
 /**

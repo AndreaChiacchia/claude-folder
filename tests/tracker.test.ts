@@ -741,6 +741,148 @@ test('headerIdOf: no header on a command line the engine draws itself, nor on th
   expect(headerIdOf(handBack('h'))).toBe('h')
 })
 
+// ---- a notification that starts no turn joins the turn before ------------------------------------
+
+/** Turn t1 (rows u1, a1) complete, with its duration line d1. */
+function endTurn1(t: ReturnType<typeof createTracker>): void {
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  onTurnComplete(t, 't1')
+  onAppend(t, duration('d1'))
+}
+
+test('a notification after the duration line that no turn follows joins the turn before when the person types; the card closes under it', () => {
+  const t = createTracker()
+  endTurn1(t)
+  expect(onAppend(t, notification('n1', 'a'))).toEqual(NOTHING)
+  expect(t.pending).toMatchObject({ kind: 'meta', startKind: 'notification', lateNotice: 'n1' })
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+  expect(t.pending).toEqual({ kind: 'typed', ids: ['u2'], header: 'u2', command: null, closer: plain('u2'), text: 'next', startKind: 'typed' })
+  expect(t.closers.get('t1')).toEqual({ id: 'n1', sticky: true })
+  expect(t.ids.get('t1')).toEqual(['u1', 'a1', 'd1', 'n1'])
+  expect(onTurnStart(t, 't2').assign).toEqual(['u2'])
+})
+
+test('several notices in a row, a hand-back among them, all join; the card closes under the newest', () => {
+  const t = createTracker()
+  endTurn1(t)
+  onAppend(t, notification('n1', 'a'))
+  onAppend(t, notification('n2', 'b'))
+  onAppend(t, handBack('h3'))
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual({ assign: ['n1', 'n2', 'h3'], to: 't1', closer: 'h3' })
+})
+
+test('a notification that starts its own turn heads it, as before', () => {
+  const t = createTracker()
+  endTurn1(t)
+  onAppend(t, notification('n1', 'a'))
+  expect(onTurnStart(t, 't2')).toMatchObject({ assign: ['n1'], header: 'n1', startKind: 'notification' })
+  expect(t.closers.get('t1')).toEqual({ id: 'd1', sticky: true })
+})
+
+test('a notification before the duration line joins the turn before, which still closes under its duration line', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  onTurnComplete(t, 't1')
+  onAppend(t, notification('n1', 'a'))
+  expect(t.pending?.lateNotice).toBeUndefined()
+  const d = onAppend(t, duration('d1'))
+  expect(d.to).toBe('t1')
+  expect(d.closer).toBe('d1')
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual({ assign: ['n1'], to: 't1', closer: null })
+  expect(t.closers.get('t1')).toEqual({ id: 'd1', sticky: true })
+})
+
+test('a notification after a drawn duration line but before turn.complete is the turn\'s sticky closer', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  expect(onAppend(t, duration('d1')).closer).toBe('d1')
+  expect(onAppend(t, notification('n1', 'a'))).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+  expect(t.closers.get('t1')).toEqual({ id: 'n1', sticky: true })
+  onTurnComplete(t, 't1')
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual(NOTHING)
+  expect(t.closers.get('t1')).toEqual({ id: 'n1', sticky: true })
+  expect(t.ids.get('t1')).toEqual(['u1', 'a1', 'd1', 'n1'])
+})
+
+test('a notification after the hidden duration line of a hand-back turn, before turn.complete, is its sticky closer', () => {
+  const t = createTracker()
+  onAgentLaunched(t, 'agentA')
+  t.lastPending = 1
+  onAppend(t, handBack('h1'))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Done.')]))
+  expect(onAppend(t, duration('d1'))).toEqual(NOTHING)
+  expect(t.closers.get('t1')).toEqual({ id: 'a1', sticky: true })
+  expect(onAppend(t, notification('n1', 'agentA'))).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+  expect(t.closers.get('t1')).toEqual({ id: 'n1', sticky: true })
+  onTurnComplete(t, 't1')
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual(NOTHING)
+  expect(t.closers.get('t1')).toEqual({ id: 'n1', sticky: true })
+  expect(t.ids.get('t1')).toEqual(['h1', 'a1', 'n1'])
+})
+
+test('a plain row after the turn\'s end, still before turn.complete, does not move the sticky closer', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('a1', 'response', 'assistant', [text('Hello')]))
+  onAppend(t, duration('d1'))
+  expect(onAppend(t, row('a2', 'response', 'assistant', [text('More')])).closer).toBeNull()
+  expect(t.closers.get('t1')).toEqual({ id: 'd1', sticky: true })
+})
+
+test('with no turn before, a notification followed by a typed prompt stays out of every card, as before', () => {
+  const t = createTracker()
+  onAppend(t, notification('n1', 'a'))
+  expect(onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))).toEqual(NOTHING)
+  expect(t.pending).toMatchObject({ kind: 'typed', ids: ['u1'] })
+})
+
+test("the person's command instead of the turn: the notification joins the turn before, the command starts its own group", () => {
+  const t = createTracker()
+  endTurn1(t)
+  onAppend(t, notification('n1', 'a'))
+  const command = row('c2', 'command', 'user', [
+    text('<command-message>iwo</command-message>\n<command-name>/iwo</command-name>\n<command-args>go</command-args>'),
+  ])
+  expect(onAppend(t, command)).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+  expect(t.pending).toMatchObject({ kind: 'command', ids: ['c2'], command: '/iwo go' })
+})
+
+test('a group the expanded text of a skill or a stamped meta starter began is replaced by a typed prompt as before', () => {
+  const t = createTracker()
+  endTurn1(t)
+  onAppend(t, skillText('s1'))
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual(NOTHING)
+  expect(t.ids.get('t1')).toEqual(['u1', 'a1', 'd1'])
+  const u = createTracker()
+  endTurn1(u)
+  onAppend(u, row('m1', 'prompt', 'user', [text('reminder')], true, undefined, 'scheduled-trigger'))
+  expect(onAppend(u, row('u2', 'prompt', 'user', [text('next')]))).toEqual(NOTHING)
+  expect(u.ids.get('t1')).toEqual(['u1', 'a1', 'd1'])
+})
+
+test('a notification while a turn runs is filed under it, as before', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  expect(onAppend(t, notification('n1', 'a'))).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+})
+
+test('a turn restored from the store takes the notification the same way', () => {
+  const t = createTracker()
+  resumeLast(t, 't1', 'd1')
+  onAppend(t, notification('n1', 'a'))
+  expect(t.pending?.lateNotice).toBe('n1')
+  expect(onAppend(t, row('u2', 'prompt', 'user', [text('next')]))).toEqual({ assign: ['n1'], to: 't1', closer: 'n1' })
+})
+
 // ---- background agents: the engine leaves some duration lines out ---------------------------------
 
 test('a hand-back turn while its agent still runs: the engine draws no duration line, so the card closes under the reply', () => {

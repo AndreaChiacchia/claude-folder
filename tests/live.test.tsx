@@ -375,6 +375,75 @@ test('a notification turn folds onto the notification line', boxedStill, async (
   expect(folded).toContain('#1')
 })
 
+test('a notification that no turn follows draws inside the turn before and folds with it', boxedStill, async ($, on) => {
+  const w = world(on)
+  const first = await liveTurn($, w, 1)
+  await append(
+    $,
+    'n1',
+    'prompt',
+    'user',
+    say('<task-notification>\n<task-id>a</task-id>\n<status>completed</status>\n<summary>Agent "x" finished</summary>\n</task-notification>'),
+    undefined,
+    false,
+    'task-notification',
+  )
+  const n = await user($, 'n1', { text: 'Agent "x" finished', origin: { kind: 'task-notification' }, task: { id: 'a', status: 'completed' } })
+  // While it waits, the engine draws it.
+  expect(textOf(await n.drawn())).toBe(ENGINE)
+  expect(sidesOf(await n.drawn())).toBe(0)
+  // The person types instead: the notification started no turn, so it joins the turn before.
+  await append($, 'u2', 'prompt', 'user', say('test'))
+  const u = await user($, 'u2')
+  await quiet(w)
+  expect(textOf(await n.drawn())).toBe(ENGINE + cardBottom)
+  expect(sidesOf(await n.drawn())).toBe(2)
+  expect(textOf(await first.d.drawn())).toBe(ENGINE)
+  expect(sidesOf(await first.d.drawn())).toBe(2)
+  expect(w.logs).toContain('claudefolder: append prompt user composer u2 -> pending typed, moved 1 to tail 1')
+  // Turn 2, in the engine's order.
+  await Promise.all([$.turn.start({ text: 'test', turnId: 't2' } as never), attach($, 2)])
+  await append($, 'b2', 'response', 'assistant', say('Hello'))
+  await Promise.all([$.turn.complete(answerOf('t2')), append($, 'd2', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
+  await w.clock.advance(1000)
+  await w.clock.advance(3000)
+  expect(await fullText(first.u)).toMatch(/▸ #1/)
+  await expectHidden(n)
+  await expectHidden(first.d)
+  expect(await fullText(u)).toBe(cardTop(2) + ENGINE)
+})
+
+test('a notification that arrives after the duration line but before the turn completes closes the card under it', boxedStill, async ($, on) => {
+  const w = world(on)
+  await append($, 'u1', 'prompt', 'user', say('test'))
+  const u = await user($, 'u1')
+  await Promise.all([$.turn.start({ text: 'test', turnId: 't1' } as never), attach($, 1)])
+  await append($, 'b1', 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b1')
+  await append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')
+  const d = await duration($, 'd1', 4000)
+  // The notification comes before the engine's `turn.complete` reached the mod: the turn still runs for the tracker.
+  await append(
+    $,
+    'n1',
+    'prompt',
+    'user',
+    say('<task-notification>\n<task-id>a</task-id>\n<status>completed</status>\n<summary>Agent "x" finished</summary>\n</task-notification>'),
+    undefined,
+    false,
+    'task-notification',
+  )
+  const n = await user($, 'n1', { text: 'Agent "x" finished', origin: { kind: 'task-notification' }, task: { id: 'a', status: 'completed' } })
+  await $.turn.complete(answerOf('t1'))
+  await quiet(w)
+  expect(textOf(await n.drawn())).toBe(ENGINE + cardBottom)
+  expect(sidesOf(await n.drawn())).toBe(2)
+  expect(textOf(await d.drawn())).toBe(ENGINE)
+  expect(sidesOf(await d.drawn())).toBe(2)
+  expect(textOf(await b.drawn())).toBe(ENGINE)
+  expect(await fullText(u)).toBe(cardTop(1) + ENGINE)
+})
+
 const SKILL = 'Base directory for this skill: C:\\skills\\iwo'
 const SKILL_COMMAND =
   '<command-message>iwo</command-message>\n<command-name>/iwo</command-name>\n<command-args>balanced fix it</command-args>'
