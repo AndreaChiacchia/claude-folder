@@ -1,7 +1,7 @@
 {
   "name": "claudefolder",
   "version": "0.1.3",
-  "description": "Folds each finished turn of the chat into one or two highlighted lines (the prompt, the turn number, the first line of the answer, the tools, the edited files and the time) that unfold with a click, set apart by a tinted band and an edge bar, a card, alternating tints or a rule, with a gliding light over the folds",
+  "description": "Folds each finished turn of the chat into one or two highlighted lines (the prompt, the turn number, the first line of the answer, the tools, the edited files and the time) that unfold with a click, set apart by a tinted band and an edge bar, a card, alternating tints or a rule, with a gliding light over the folds and a shimmer over each turn's last message",
   "author": { "name": "AndreaChiacchia", "url": "https://github.com/AndreaChiacchia" },
   "types": "./types/index.d.ts",
   "license": "MIT",
@@ -47,6 +47,27 @@
       "description": "How the folds move. lively: a turn that folds or opens flips its marker with a gold flash and sends one light round its header's outline (a folded card's whole border, an open card's top line, the header's edge bar cell, the rule, a zebra band's ends); pointing at a header's marker and number sends one lap too. subtle: the same with a softer flash and light, the light on a fold or an open only. off: still lines; pointing still highlights the marker and number and a click still folds or opens.",
       "default": "lively",
       "options": ["lively", "subtle", "off"]
+    },
+    "shimmer": {
+      "type": "string",
+      "title": "Last message shimmer",
+      "description": "When a turn ends, its last message takes a tint, brightens once to a lighter shade and dims back, holds the tint, then returns to its usual colors after 3.7 s. gold: gold that brightens to a bright gold. text: the text dims a little, brightens back to full text color once and dims again. teal, silver, lavender: those tints. off: none. Motion off turns it off too; subtle makes the glow half as bright. A fold, an open or the next turn ends it.",
+      "default": "gold",
+      "options": ["gold", "text", "teal", "silver", "lavender", "off"]
+    },
+    "heat": {
+      "type": "string",
+      "title": "Effort heat",
+      "description": "on: a folded turn's frame (the card's border, the rule, the rail's edge bar, the zebra band's ends) is teal for a quick turn (under 3 tools and 30 s), amber, or hot orange for a heavy one (10 tools or more, or 2 minutes or more). off: the usual colors.",
+      "default": "off",
+      "options": ["off", "on"]
+    },
+    "foldAll": {
+      "type": "string",
+      "title": "Fold all on new turn",
+      "description": "on: when a turn starts, every earlier turn folds, the ones you opened yourself included. off: a turn you opened or closed yourself keeps its state. /folder focus does the same for one session.",
+      "default": "off",
+      "options": ["off", "on"]
     }
   }
 }

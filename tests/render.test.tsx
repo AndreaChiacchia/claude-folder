@@ -319,23 +319,23 @@ const assistant = ($: Engine, requestId: string, props: Record<string, unknown> 
     viewport: VIEWPORT,
   })
 
-const toolUse = ($: Engine, id: string) =>
+const toolUse = ($: Engine, id: string, props: Record<string, unknown> = {}) =>
   $.ui.mount({
     plugin: 'claudefolder',
     surface: 'terminal',
     component: 'ToolUse',
     requestId: id,
-    props: { tool_use_id: id, tool: 'Edit', input: {}, isRunning: false, isErrored: false, isInterrupted: false } as never,
+    props: { tool_use_id: id, tool: 'Edit', input: {}, isRunning: false, isErrored: false, isInterrupted: false, ...props } as never,
     viewport: VIEWPORT,
   })
 
-const toolResult = ($: Engine, id: string) =>
+const toolResult = ($: Engine, id: string, props: Record<string, unknown> = {}) =>
   $.ui.mount({
     plugin: 'claudefolder',
     surface: 'terminal',
     component: 'ToolResult',
     requestId: id,
-    props: { tool_use_id: id, tool: 'Edit', output: 'ok', isErrored: false } as never,
+    props: { tool_use_id: id, tool: 'Edit', output: 'ok', isErrored: false, ...props } as never,
     viewport: VIEWPORT,
   })
 
@@ -535,20 +535,68 @@ test('rail: two open turns in a row keep a gap line with no bar between them', s
 })
 
 test('ctrl+o and --verbose draw every row', still, async ($, on) => {
-  world(on)
+  const w = world(on)
   await runTurn($, 1)
   await runTurn($, 2)
+  // The view is read from the duration lines: once one has drawn expanded, every row draws in full.
+  const d1 = await duration($, 'd1', 41_000, { isExpanded: true })
+  expect(textOf(await d1.drawn())).toBe(ENGINE)
   const u1 = await user($, 'u1', { isExpanded: true })
   expect(textOf(await u1.drawn())).toBe(ENGINE)
   expect(railOf(await u1.drawn())).toBeUndefined()
-  // The rows that carry no flag follow the last row that did.
   const b1 = await assistant($, 'b1')
   expect(textOf(await b1.drawn())).toBe(ENGINE)
   expect(railOf(await b1.drawn())).toBeUndefined()
+  const out = await toolResult($, 'toolu_1', { isExpanded: true })
+  expect(textOf(await out.drawn())).toBe(ENGINE)
+  // Back to the normal view: the duration line draws with the flag off, and the other rows follow.
+  await d1.redraw({ word: 'Baked', durationMs: 41_000, isExpanded: false } as never)
   await u1.redraw({ text: 'x', origin: { kind: 'composer' }, isExpanded: false } as never)
   expect(await fullText(u1)).toBe(FOLDED_1)
   await b1.redraw()
+  await out.redraw()
   expect(textOf(await b1.drawn())).toBe('')
+  // The result row still carries its own flag (a click opened it), and hides with its folded turn all the same.
+  expect(textOf(await out.drawn())).toBe('')
+  await w.clock.advance(100)
+  expect(w.logs).toContain('claudefolder: invalidate view')
+  expect(w.logs).toContain('claudefolder: view expanded')
+  expect(w.logs).toContain('claudefolder: view normal')
+})
+
+test('a row clicked open hides with its folded turn, and opens no other row', still, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  await runTurn($, 2)
+  // The prompt row clicked open is turn 1's header: the card, never the engine's prompt.
+  const u1 = await user($, 'u1', { isExpanded: true })
+  expect(await fullText(u1)).toBe(FOLDED_1)
+  for (const ui of [await toolUse($, 'toolu_1', { isExpanded: true }), await toolResult($, 'toolu_1', { isExpanded: true }), await assistant($, 'b1')]) {
+    const drawn = await ui.drawn()
+    expect(drawn).toMatchObject({ type: 'Box' })
+    expect(textOf(drawn)).toBe('')
+  }
+  await w.clock.advance(100)
+  expect(w.logs.filter(l => l.startsWith('claudefolder: invalidate view') || l.startsWith('claudefolder: view '))).toEqual([])
+})
+
+test('a row clicked open in an open turn keeps its bar, folds with the turn and comes back open', still, async ($, on) => {
+  world(on)
+  await runTurn($, 1)
+  const u1 = await user($, 'u1')
+  expect(await fullText(u1)).toBe(OPEN_1 + ENGINE)
+  const out = await toolResult($, 'toolu_1', { isExpanded: true })
+  expect(textOf(await out.drawn())).toBe(ENGINE)
+  expect(textOf(railOf(await out.drawn()))).toBe(railText('▌'))
+  expect((await folder($, 'close 1')).text).toBe('Folded turn #1.')
+  await u1.redraw()
+  await out.redraw()
+  expect(await fullText(u1)).toBe(FOLDED_1)
+  expect(textOf(await out.drawn())).toBe('')
+  await folder($, 'open 1')
+  await out.redraw()
+  expect(textOf(await out.drawn())).toBe(ENGINE)
+  expect(textOf(railOf(await out.drawn()))).toBe(railText('▌'))
 })
 
 test('off the fullscreen terminal everything draws as the engine does', still, async ($, on) => {
@@ -615,9 +663,11 @@ test('an interrupted turn says so in red, and has no reply to press', still, asy
   await runTurn($, 1, { reason: 'aborted', answer: '' })
   await runTurn($, 2)
   const u1 = await user($, 'u1')
-  expect(await fullText(u1)).toBe('▌ ▸ #1 · fix the login' + sp(76) + '▌   └ 1 tool · edited auth.ts · 41s · interrupted' + sp(49))
+  // A failed turn keeps a red ✗ right after its number.
+  expect(await fullText(u1)).toBe('▌ ▸ #1 ✗ · fix the login' + sp(74) + '▌   └ 1 tool · edited auth.ts · 41s · interrupted' + sp(49))
   const words = (await moduleRuns(u1, head(1))).filter(r => r.text === 'interrupted')
   expect(words.some(w => w.color === '#ff0000')).toBe(true)
+  expect((await moduleRuns(u1, head(1))).some(r => r.text.includes('✗') && r.color === '#ff0000')).toBe(true)
   const props = clients(await u1.drawn())[0]?.props?.props as FolderHeadProps
   expect(props.press).toEqual([[0, 2, 4, 0]])
 })
@@ -674,7 +724,7 @@ test('/folder toggles, opens and closes turns by number, last or all', still, as
 test('/folder with bad arguments prints its usage, and a running turn is left alone', still, async ($, on) => {
   world(on)
   await runTurn($, 1)
-  const usage = 'Usage: /folder (toggle all) · /folder open [<n> | last | all] · /folder close [<n> | last | all]'
+  const usage = 'Usage: /folder (toggle all) · /folder open [<n> | last | all] · /folder close [<n> | last | all] · /folder focus [off]'
   expect((await folder($, 'frob')).text).toBe(usage)
   expect((await folder($, 'open x')).text).toBe(usage)
   expect((await folder($, 'open 1 2')).text).toBe(usage)
@@ -846,7 +896,7 @@ test('a click on the marker or the number folds or opens the turn; a click elsew
   expect(await fullText(u1)).toBe(FOLDED_1)
 })
 
-const boxed = { options: { style: 'boxed' } } as const
+const boxed = { options: { style: 'boxed', shimmer: 'off' } } as const
 
 test('Lively: one lap when the pointer enters the marker and number, none while it stays', boxed, async ($, on) => {
   world(on)
@@ -890,7 +940,7 @@ test('Lively: leaving and entering again starts one more lap, never a second one
   expect(await lapStarts(u1, head(1), 60)).toEqual({ starts: 1, litFrames: 40 })
 })
 
-test('Subtle: hovering runs no lap, a click one lap at the subtle peak', { options: { motion: 'subtle', style: 'boxed' } }, async ($, on) => {
+test('Subtle: hovering runs no lap, a click one lap at the subtle peak', { options: { motion: 'subtle', style: 'boxed', shimmer: 'off' } }, async ($, on) => {
   const w = world(on)
   await runTurn($, 1)
   await runTurn($, 2)
@@ -945,7 +995,7 @@ const NOT_THE_TARGET = {
 } as const
 
 for (const style of ['rail', 'boxed', 'zebra', 'rules'] as const) {
-  test(`${style}: a folded header's title, reply and card body neither click nor tint, and start no lap`, { options: { style } }, async ($, on) => {
+  test(`${style}: a folded header's title, reply and card body neither click nor tint, and start no lap`, { options: { style, shimmer: 'off' } }, async ($, on) => {
     world(on)
     await runTurn($, 1)
     await runTurn($, 2)
@@ -1093,19 +1143,19 @@ async function litCells($: Engine, on: On, at: [number, number]): Promise<[numbe
   return differing(lit, await cellStyles(u1, head(1))).filter(([r, c]) => marker === undefined || r !== marker[0] || c !== marker[1])
 }
 
-test('Lively click, rail: the light is on the edge bar cells alone', async ($, on) => {
+test('Lively click, rail: the light is on the edge bar cells alone', { options: { shimmer: 'off' } }, async ($, on) => {
   const cells = await litCells($, on, [2, 0])
   expect(cells.length).toBeGreaterThan(0)
   expect(cells.every(([r, c]) => r === 0 && c === 0)).toBe(true)
 })
 
-test('Lively click, zebra: the light is on the caps alone', { options: { style: 'zebra' } }, async ($, on) => {
+test('Lively click, zebra: the light is on the caps alone', { options: { style: 'zebra', shimmer: 'off' } }, async ($, on) => {
   const cells = await litCells($, on, [1, 0])
   expect(cells.length).toBeGreaterThan(0)
   expect(cells.every(([r, c]) => r === 0 && (c === 0 || c === 97))).toBe(true)
 })
 
-test('Lively click, rules: the light is on the rule alone', { options: { style: 'rules' } }, async ($, on) => {
+test('Lively click, rules: the light is on the rule alone', { options: { style: 'rules', shimmer: 'off' } }, async ($, on) => {
   const cells = await litCells($, on, [4, 0])
   expect(cells.length).toBeGreaterThan(0)
   expect(cells.every(([r]) => r === 0)).toBe(true)
@@ -1117,7 +1167,7 @@ test('Lively click, boxed: the light is on the open top line outside the number'
   expect(cells.every(([r, c]) => r === 0 && (c < 5 || c > 6))).toBe(true)
 })
 
-test('there is no ripple: a folded header at rest never lights on its own', async ($, on) => {
+test('there is no ripple: a folded header at rest never lights on its own', { options: { shimmer: 'off' } }, async ($, on) => {
   const w = world(on)
   await runTurn($, 1)
   const u1 = await user($, 'u1')
@@ -1148,7 +1198,7 @@ async function foldedLively($: Engine, on: On) {
   return { w, u1 }
 }
 
-test('Lively (rail): the fold effect runs in the header module on its own clock, from a complete card, with no plugin write', async ($, on) => {
+test('Lively (rail): the fold effect runs in the header module on its own clock, from a complete card, with no plugin write', { options: { shimmer: 'off' } }, async ($, on) => {
   const { w, u1 } = await foldedLively($, on)
   // The header carries the effect and its rest cells: the plugin draws it once.
   const props = clients(await u1.drawn())[0]?.props?.props as FolderHeadProps
@@ -1190,7 +1240,7 @@ test('Lively (rail): the fold effect runs in the header module on its own clock,
   expect(w.writes.length).toBe(written)
 })
 
-test('a click fold draws the complete folded card in its first frame, and asks no invalidate', async ($, on) => {
+test('a click fold draws the complete folded card in its first frame, and asks no invalidate', { options: { shimmer: 'off' } }, async ($, on) => {
   const w = world(on)
   await runTurn($, 1)
   await runTurn($, 2)
@@ -1215,7 +1265,7 @@ test('a click fold draws the complete folded card in its first frame, and asks n
   expect(redraws()).toBe(before)
 })
 
-test('Subtle: a softer flash, and the plugin writes nothing while the effect runs', { options: { motion: 'subtle' } }, async ($, on) => {
+test('Subtle: a softer flash, and the plugin writes nothing while the effect runs', { options: { motion: 'subtle', shimmer: 'off' } }, async ($, on) => {
   const { w, u1 } = await foldedLively($, on)
   expect((await moduleRuns(u1, head(1))).some(t => t.text === '▾' && t.color === hex(mixColor(0x8a8a8a, GOLD, 0.5)))).toBe(true)
   const written = w.writes.length
@@ -1289,7 +1339,7 @@ test('in the fallback the bars carry no hover, and the only text in a Button is 
   }
 })
 
-test('in the fallback the header draws at rest: the motion lives in the module, so nothing shimmers', async ($, on) => {
+test('in the fallback the header draws at rest: the motion lives in the module, so nothing shimmers', { options: { shimmer: 'off' } }, async ($, on) => {
   const w = world(on)
   await runTurn($, 1)
   const u1 = await user($, 'u1')
@@ -1776,7 +1826,7 @@ test("boxed, lively: an open card's sides and bottom are plain Text with no hove
   for (const drawn of [u1, b1, d1]) expect(concealers(drawn)).toEqual([])
 })
 
-test('rail, lively: the open turn bar is plain Text down every row', async ($, on) => {
+test('rail, lively: the open turn bar is plain Text down every row', { options: { shimmer: 'off' } }, async ($, on) => {
   world(on)
   await runTurn($, 1)
   const b1 = await (await assistant($, 'b1')).drawn()

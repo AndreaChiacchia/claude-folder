@@ -1,7 +1,7 @@
 import type { Edge, FolderTurn, Marker, Style } from '../types'
-import { BOX, DEFAULT, EDGES, MARKERS, displayWidth } from './cells'
+import { BOX, DEFAULT, EDGES, GLYPH, MARKERS, displayWidth } from './cells'
 import type { Cell, Palette } from './cells'
-import { SEP, cutTo, formatDuration, statsParts } from './summary'
+import { SEP, cutTo, effortOf, formatDuration, isFailedTurn, statsParts } from './summary'
 import type { StatPart } from './summary'
 
 /** The least room a title keeps when the number and the stats share its line. */
@@ -49,7 +49,7 @@ export type HeaderModel = {
 }
 
 export type HeaderInput = {
-  turn: Pick<FolderTurn, 'n' | 'title' | 'reply' | 'tools' | 'files' | 'durationMs' | 'status'>
+  turn: Pick<FolderTurn, 'n' | 'title' | 'reply' | 'tools' | 'files' | 'durationMs' | 'status' | 'failedTools'>
   style: Style
   lines: 1 | 2 | 3
   marker: Marker
@@ -57,6 +57,8 @@ export type HeaderInput = {
   palette: Palette
   columns: number
   folded: boolean
+  /** True: a folded header's frame takes the turn's effort color; missing reads as false. */
+  heat?: boolean
 }
 
 /** The zebra band's rounded ends: the right half block closes its left side, the left half block its right side. */
@@ -126,9 +128,15 @@ function lineOneParts(ctx: Ctx, lines: 1 | 2 | 3): TextPart[] {
   ]
 }
 
-/** The turn number, bold: in the figures color when folded, in the title's open color when open. */
+/**
+ * The turn number, bold: in the figures color when folded, in the title's open color when open. A failed turn's number is
+ * followed by a red `✗` (a part of its own: the number stays the first part, so the pressable range does not change).
+ */
 function numberParts(ctx: Ctx): TextPart[] {
-  return [part(ctx, '#' + ctx.turn.n, 'number', ctx.folded ? ctx.palette.figures : ctx.palette.titleOpen, { bold: true })]
+  const number = part(ctx, '#' + ctx.turn.n, 'number', ctx.folded ? ctx.palette.figures : ctx.palette.titleOpen, { bold: true })
+  if (!isFailedTurn(ctx.turn)) return [number]
+
+  return [number, part(ctx, ' ' + String.fromCodePoint(GLYPH.fail), 'fail', ctx.palette.fail)]
 }
 
 /** Line 2 of a folded header: the branch, the reply, the stats; null when there is neither a reply nor stats. */
@@ -218,13 +226,23 @@ export function buildHeader(input: HeaderInput): HeaderModel {
   const glyphs = MARKERS[marker]
   const mkCp = folded ? glyphs.folded : glyphs.open
   const mkFg = folded ? palette.marker : palette.markerOpen
-  // Boxed and rules share the frame colors: teal folded, grey open.
-  const frameColor = folded ? palette.frame : palette.frameOpen
+  // Effort heat: a folded header's frame takes the turn's effort color (null: the usual colors).
+  const effort = effortOf(turn)
+  const heatFg: number | null =
+    input.heat === true && folded
+      ? effort === 'heavy'
+        ? palette.heatHeavy
+        : effort === 'quick'
+          ? palette.heatQuick
+          : palette.heatMedium
+      : null
+  // Boxed and rules share the frame colors: teal folded (or the effort color), grey open.
+  const frameColor = folded ? (heatFg ?? palette.frame) : palette.frameOpen
 
   let lay: Layout
   if (style === 'rail') {
     const bg = folded ? palette.band : palette.bandOpen
-    const edgeCell = (): Cell => glyph(EDGES[edge], palette.rail, bg)
+    const edgeCell = (): Cell => glyph(EDGES[edge], heatFg ?? palette.rail, bg)
     lay = {
       lead1: () => [edgeCell(), space(bg), glyph(mkCp, mkFg, bg), space(bg)],
       lead2: () => [edgeCell(), space(bg), space(bg), space(bg)],
@@ -236,11 +254,11 @@ export function buildHeader(input: HeaderInput): HeaderModel {
     const bg = folded ? (turn.n % 2 === 1 ? palette.zebraA : palette.zebraB) : palette.bandOpen
     // The band's rounded ends are glyphs in the band color on the terminal's background; the band itself covers the cells between.
     lay = {
-      lead1: () => [glyph(CAP_LEFT, bg, DEFAULT), glyph(mkCp, mkFg, bg), space(bg)],
-      lead2: () => [glyph(CAP_LEFT, bg, DEFAULT), space(bg), space(bg)],
+      lead1: () => [glyph(CAP_LEFT, heatFg ?? bg, DEFAULT), glyph(mkCp, mkFg, bg), space(bg)],
+      lead2: () => [glyph(CAP_LEFT, heatFg ?? bg, DEFAULT), space(bg), space(bg)],
       room: W - 4,
       bg,
-      close: () => glyph(CAP_RIGHT, bg, DEFAULT),
+      close: () => glyph(CAP_RIGHT, heatFg ?? bg, DEFAULT),
     }
   } else if (style === 'boxed') {
     // The card's marker and number sit on its top border (row 0); the rows below hold the title and the answer only.

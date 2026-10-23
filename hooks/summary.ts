@@ -102,6 +102,23 @@ export function statsParts(
   return parts
 }
 
+/** How much a turn took: a quick one, a medium one, a heavy one. */
+export type Effort = 'quick' | 'medium' | 'heavy'
+
+/** The turn's effort: heavy at 10 tools or 2 minutes, quick under 3 tools and 30 s, else medium. */
+export function effortOf(turn: Pick<FolderTurn, 'tools' | 'durationMs'>): Effort {
+  const ms = turn.durationMs ?? 0
+  if (turn.tools >= 10 || ms >= 120_000) return 'heavy'
+  if (turn.tools < 3 && ms < 30_000) return 'quick'
+
+  return 'medium'
+}
+
+/** True for a turn that was interrupted, ended in an error, or had at least one main-loop tool call fail. */
+export function isFailedTurn(turn: Pick<FolderTurn, 'status' | 'failedTools'>): boolean {
+  return turn.status === 'interrupted' || turn.status === 'error' || (turn.failedTools ?? 0) > 0
+}
+
 /** `s` when it fits `width` cells, else its longest prefix that leaves room for a closing `…`. */
 export function cutTo(s: string, width: number): string {
   if (displayWidth(s) <= width) return s

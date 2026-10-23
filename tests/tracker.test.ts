@@ -1017,3 +1017,34 @@ test('the row keys kept per turn stop at 400', () => {
   expect(t.ids.get('t1')!.length).toBe(MAX_ROW_IDS)
   expect(t.ids.get('t1')![0]).toBe('u1')
 })
+
+test('lastText: the running turn\'s newest response row with text, cleared by a tool call after it', () => {
+  const t = createTracker()
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  expect(t.lastText.get('t1')).toBeUndefined()
+  // A text response row sets it, sized by its text.
+  onAppend(t, row('b1', 'response', 'assistant', [text('Hello\nthere')]))
+  expect(t.lastText.get('t1')).toEqual({ key: 'b1', chars: 11, lines: 2 })
+  // A later row with a tool call clears it: the last message is not the last row.
+  onAppend(t, row('a2', 'response', 'assistant', [call('toolu_1')]))
+  expect(t.lastText.get('t1')).toBeNull()
+  // Rows that are not responses leave it alone.
+  onAppend(t, row('r1', 'tool-result', 'user', [result('toolu_1')]))
+  expect(t.lastText.get('t1')).toBeNull()
+  // A later text row sets it again, and a row without text keeps the one before.
+  onAppend(t, row('b2', 'response', 'assistant', [text('Done.')]))
+  expect(t.lastText.get('t1')).toEqual({ key: 'b2', chars: 5, lines: 1 })
+  onAppend(t, row('b3', 'response', 'assistant', [text('   ')]))
+  expect(t.lastText.get('t1')).toEqual({ key: 'b2', chars: 5, lines: 1 })
+})
+
+test('lastText: a row appended while idle sets nothing, and a uuid is keyed like the draw', () => {
+  const t = createTracker()
+  onAppend(t, row('b0', 'response', 'assistant', [text('Hello')]))
+  expect(t.lastText.size).toBe(0)
+  onAppend(t, row('u1', 'prompt', 'user', [text('hi')]))
+  onTurnStart(t, 't1')
+  onAppend(t, row('b6d78f44-8266-4aaa-84e5-0041bd1ce1bd', 'response', 'assistant', [text('Hello')]))
+  expect(t.lastText.get('t1')?.key).toBe('b6d78f44-8266-4aaa-84e5')
+})

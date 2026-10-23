@@ -277,6 +277,8 @@ const head: ClientModule<FolderHeadProps, State> = (props, surface) => {
   const lap = toggleActive(props, ticks) ? toggleFrame(props, ticks) : null
   const light: Light | null = lap !== null ? { f: lap, mode: 'hover' } : s.light
   const lit = light === null ? new Map<number, number>() : lightOf(props, light)
+  // A failed turn's fold lap runs in its own color (red) instead of the glint; a hover light keeps the glint.
+  const lapGlint = lap !== null && props.fx?.lapColor !== undefined ? props.fx.lapColor : props.glint
   const tinted = (row: number, col: number): number | null => {
     if (s.hover === -1) return null
     for (const [r, c, width, which] of props.press) {
@@ -294,7 +296,7 @@ const head: ClientModule<FolderHeadProps, State> = (props, surface) => {
           let fg = fg0
           let flags = flags0 & 3
           const amount = lit.get(row * ROW_KEY + col)
-          if (amount !== undefined && fg >= 0) fg = mix(fg, props.glint, amount)
+          if (amount !== undefined && fg >= 0) fg = mix(fg, lapGlint, amount)
           const tint = tinted(row, col)
           if (tint !== null) {
             fg = tint

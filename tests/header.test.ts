@@ -471,3 +471,117 @@ test('three lines keep a failure word as its own red part on the stats line', ()
   expect(texts(m)[2]).toBe(fit('▌   └ 1 tool · edited auth.ts · 41s · interrupted'))
   expect(m.rows[2]!.text!.parts.find(p => p.kind === 'fail')).toMatchObject({ text: 'interrupted', fg: 0xff0000 })
 })
+
+// ---- effort heat -------------------------------------------------------------------------------
+
+const QUICK = turn({ tools: 2, durationMs: 29_000 })
+const MEDIUM = turn()
+const HEAVY = turn({ tools: 10 })
+const HEAT = (p: typeof PALETTES.dark): [HeaderInput['turn'], number][] => [
+  [QUICK, p.heatQuick],
+  [MEDIUM, p.heatMedium],
+  [HEAVY, p.heatHeavy],
+]
+
+test('heat, boxed: the folded card takes the effort color on its border, corners and sides', () => {
+  for (const palette of [PALETTES.dark, PALETTES.light]) {
+    for (const [t, color] of HEAT(palette)) {
+      const m = buildHeader(input({ style: 'boxed', heat: true, turn: t, palette }))
+      expect(m.frame).toBe(color)
+      const framing = new Set([0x2500, 0x256d, 0x256e, 0x2570, 0x256f, 0x2502])
+      const cells = m.rows.flatMap(r => r.cells).filter(c => framing.has(c.cp))
+      expect(cells.length).toBeGreaterThan(190)
+      expect(cells.every(c => c.fg === color)).toBe(true)
+    }
+  }
+})
+
+test('heat, rules: the folded rule takes the effort color', () => {
+  for (const [t, color] of HEAT(PALETTES.dark)) {
+    const m = buildHeader(input({ style: 'rules', heat: true, turn: t }))
+    expect(m.frame).toBe(color)
+    const dashes = m.rows[0]!.cells.filter(c => c.cp === 0x2500)
+    expect(dashes.length).toBeGreaterThan(80)
+    expect(dashes.every(c => c.fg === color)).toBe(true)
+  }
+})
+
+test('heat, rail: the edge bar cell of each header line takes the effort color, the band stays', () => {
+  for (const [t, color] of HEAT(PALETTES.dark)) {
+    const m = buildHeader(input({ heat: true, turn: t }))
+    expect(m.rows.length).toBe(2)
+    for (const row of m.rows) expect(row.cells[0]).toEqual({ cp: 0x258c, fg: color, bg: 0x1c3030 })
+    expect(m.rows[0]!.cells[2]).toEqual({ cp: 0x25b8, fg: 0x00afaf, bg: 0x1c3030 })
+  }
+  expect(buildHeader(input({ heat: true, turn: HEAVY })).rows[0]!.cells[0]!.fg).toBe(0xff5f00)
+})
+
+test('heat, zebra: the caps take the effort color on the terminal background, the band stays', () => {
+  for (const [t, color] of HEAT(PALETTES.dark)) {
+    const m = buildHeader(input({ style: 'zebra', heat: true, turn: t }))
+    for (const row of m.rows) {
+      expect(row.cells[0]).toEqual({ cp: 0x2590, fg: color, bg: 0x01000000 })
+      expect(row.cells[97]).toEqual({ cp: 0x258c, fg: color, bg: 0x01000000 })
+      expect(row.cells.slice(1, 97).every(c => c.bg === 0x1c3030)).toBe(true)
+    }
+  }
+})
+
+test('heat: open headers, and a missing or false heat, give the usual colors', () => {
+  for (const style of STYLES) {
+    expect(buildHeader(input({ style, folded: false, heat: true, turn: HEAVY }))).toEqual(buildHeader(input({ style, folded: false, turn: HEAVY })))
+    expect(buildHeader(input({ style, heat: false, turn: HEAVY }))).toEqual(buildHeader(input({ style, turn: HEAVY })))
+  }
+  expect(buildHeader(input({ style: 'boxed', turn: HEAVY })).frame).toBe(PALETTES.dark.frame)
+  expect(buildHeader(input({ heat: true, turn: HEAVY })).band).toBe(0x1c3030)
+})
+
+// ---- failed turns ------------------------------------------------------------------------------
+
+const FAILED = [turn({ status: 'interrupted' }), turn({ status: 'error' }), turn({ failedTools: 2 })]
+
+test('a failed turn keeps a red cross after its number, folded or open, in every style', () => {
+  for (const style of STYLES) {
+    for (const folded of [true, false]) {
+      for (const t of FAILED) {
+        const parts = buildHeader(input({ style, folded, turn: t })).rows[0]!.text!.parts
+        expect(parts[0]).toMatchObject({ text: '#1', kind: 'number' })
+        expect(parts[1]).toEqual({ text: ' ✗', kind: 'fail', fg: 0xff0000, bg: parts[0]!.bg, bold: false, dim: false })
+      }
+    }
+  }
+  expect(buildHeader(input({ turn: FAILED[0]!, palette: PALETTES.light })).rows[0]!.text!.parts[1]).toMatchObject({ text: ' ✗', fg: 0xd70000 })
+  // A turn that did not fail has none, and neither has a running one.
+  expect(buildHeader(input()).rows[0]!.text!.parts.some(p => p.text.includes('✗'))).toBe(false)
+  expect(buildHeader(input({ turn: turn({ failedTools: 0 }) })).rows[0]!.text!.parts.some(p => p.text.includes('✗'))).toBe(false)
+})
+
+test('a failed turn: the cross sits between the number and the rest, in each style', () => {
+  const t = turn({ failedTools: 1 })
+  expect(texts(buildHeader(input({ turn: t })))[0]).toBe(fit('▌ ▸ #1 ✗ · fix the login'))
+  expect(texts(buildHeader(input({ turn: t, folded: false })))).toEqual([fit('▌ ▾ #1 ✗')])
+  expect(texts(buildHeader(input({ style: 'zebra', turn: t })))[0]).toBe(fit('▐▸ #1 ✗ · fix the login', '▌'))
+  expect(texts(buildHeader(input({ style: 'boxed', turn: t })))[0]).toBe('╭─ ▸ #1 ✗ ' + '─'.repeat(87) + '╮')
+  expect(texts(buildHeader(input({ style: 'boxed', turn: t, folded: false })))[0]).toBe('╭─ ▾ #1 ✗ ' + '─'.repeat(87) + '╮')
+  expect(texts(buildHeader(input({ style: 'rules', turn: t })))[0]).toBe('─── ▸ #1 ✗ · 41s ' + '─'.repeat(81))
+})
+
+test('a failed turn: the pressable range is the marker and the number alone, as for any turn', () => {
+  for (const style of STYLES) {
+    for (const folded of [true, false]) {
+      const failed = buildHeader(input({ style, folded, turn: turn({ status: 'error' }) }))
+      expect(pressOf(failed)).toEqual(pressOf(buildHeader(input({ style, folded }))))
+      expect(failed.marker).toEqual(buildHeader(input({ style, folded })).marker)
+    }
+  }
+})
+
+test('a failed turn: the title gives up the two cells of the cross', () => {
+  const t = turn({ failedTools: 1, title: 'x'.repeat(200) })
+  const plainText = texts(buildHeader(input({ turn: turn({ title: 'x'.repeat(200) }), lines: 1, columns: 40 })))[0]!
+  const failedText = texts(buildHeader(input({ turn: t, lines: 1, columns: 40 })))[0]!
+  expect(displayWidth(failedText)).toBe(38)
+  expect(failedText.startsWith('▌ ▸ #1 ✗ · ')).toBe(true)
+  expect(plainText.startsWith('▌ ▸ #1 · ')).toBe(true)
+  expect(failedText.split('x').length).toBe(plainText.split('x').length - 2)
+})

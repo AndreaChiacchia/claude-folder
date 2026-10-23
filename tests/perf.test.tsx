@@ -129,7 +129,7 @@ async function hidden(ui: { drawn: () => Promise<unknown> }): Promise<boolean> {
 }
 
 const still = { plugins: [counter], options: { motion: 'off', style: 'boxed' } } as const
-const lively = { plugins: [counter], options: { style: 'boxed' } } as const
+const lively = { plugins: [counter], options: { style: 'boxed', shimmer: 'off' } } as const
 
 // ---- no global invalidate at a turn boundary, a click or /folder --------------------------------
 

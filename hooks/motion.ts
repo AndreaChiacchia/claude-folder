@@ -16,6 +16,25 @@ export const MAX_REFUSED_MOUNTS = 3
 /** A finished turn folds this long after it ends under `foldWhen: finish`. */
 export const FOLD_DELAY_MS = 1500
 
+/** The last message's glow lasts this long (ms): the fade in, the glow's rise and fall, a hold and the fade out. */
+export const SHINE_MS = 3700
+/** The shimmer's tint fades in over this long (ms). */
+export const SHINE_FADE_IN_MS = 300
+/** The glow rises from the tint to the highlight over this long (ms). */
+export const SHINE_RISE_MS = 900
+/** The glow falls back from the highlight to the tint over this long (ms). */
+export const SHINE_FALL_MS = 1500
+/** After the glow the tint holds still this long (ms) before it fades out. */
+export const SHINE_HOLD_MS = 500
+/** The shimmer's tint fades out over this long (ms). */
+export const SHINE_FADE_OUT_MS = 500
+/** A last message over this many characters keeps the engine's drawing. */
+export const SHINE_MAX_CHARS = 6000
+/** A last message over this many lines keeps the engine's drawing. */
+export const SHINE_MAX_LINES = 120
+/** The highlight's strength (0..1) by motion level. */
+export const SHINE_STRENGTH = { lively: 1, subtle: 0.5 }
+
 /** How strong each effect is at a motion level. Lights only ever touch foregrounds: no effect changes a background. */
 export type Level = {
   /** The marker flip's gold flash (0..1). */

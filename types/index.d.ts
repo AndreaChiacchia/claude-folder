@@ -4,6 +4,9 @@ export type Motion = 'lively' | 'subtle' | 'off'
 /** When a finished turn folds: when the next turn starts, or a moment after it ends. */
 export type FoldWhen = 'next' | 'finish'
 
+/** The last message's shimmer color, or none. */
+export type Shimmer = 'gold' | 'text' | 'teal' | 'silver' | 'lavender' | 'off'
+
 /** The glyph pair before each turn, folded then open. */
 export type Marker = 'triangles' | 'hollow' | 'plus' | 'ascii'
 
@@ -22,6 +25,11 @@ export type Settings = {
   marker: Marker
   edge: Edge
   motion: Motion
+  shimmer: Shimmer
+  /** Folded headers warm with the turn's effort. */
+  heat: boolean
+  /** Every earlier turn folds when a turn starts, ones the user opened included. */
+  foldAll: boolean
 }
 
 /** How a turn stands: still going, answered, interrupted by the user, or ended by an error or a refusal. */
@@ -59,6 +67,10 @@ export type FolderTurn = {
   closer: string | null
   /** What started the turn: a typed prompt, an agent's message (a hand-back), a notification, or anything else. Missing reads as `typed`. */
   startKind?: 'typed' | 'peer' | 'notification' | 'other'
+  /** How many of the main loop's tool calls in the turn failed (an error or a refusal); missing reads as 0. */
+  failedTools?: number
+  /** While the turn's last message shimmers: the `rowKeyOf` key of that row and when the shimmer started (ms since the epoch); null or missing otherwise. */
+  shine?: { row: string; at: number } | null
 }
 
 /** A turn as it is saved: the member, and the `rowKeyOf` keys of every row filed under it (at most 400), so a restart can map the rows again. */
@@ -84,6 +96,8 @@ export type FoldFx = {
   flash: number
   /** The flash color (`0xRRGGBB`). */
   gold: number
+  /** The color of a fold's lap (`0xRRGGBB`) when it is not the header's glint: a failed turn's red. */
+  lapColor?: number
 }
 
 /**
@@ -116,6 +130,34 @@ export type FolderHeadProps = {
 
 export type FolderClientProps = FolderHeadProps
 
+/**
+ * One logical line of a message for the shimmer: `prefix` is drawn before the first wrapped line (a list marker, a quote
+ * bar, a code indent); `indent` is how many spaces each continuation line starts with; run flags are 1 bold, 2 italic. A
+ * `rule` line has no runs and draws `─` across the wrap width.
+ */
+export type ShineLine = { kind: 'text' | 'rule'; prefix: string; indent: number; runs: [text: string, flags: number][] }
+
+/** What the shimmer's surface module (`hooks/shineClient.tsx`) is handed for a message. Plain data only. */
+export type FolderShineProps = {
+  kind: 'shine'
+  turnId: string
+  /** Ms since the shimmer started, at the hook's draw. */
+  age: number
+  /** The region's width in cells. */
+  cols: number
+  /** Draw `● ` first (the row's `isFirstOfReply`). */
+  bullet: boolean
+  lines: ShineLine[]
+  /** The reply's rest color (`0xRRGGBB`). */
+  text: number
+  /** The tint (`0xRRGGBB`). */
+  base: number
+  /** The highlight (`0xRRGGBB`). */
+  peak: number
+  /** The highlight's strength, 0..1. */
+  strength: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     claudefolder: {
@@ -127,6 +169,8 @@ declare module 'claude-code' {
       order: string[]
       /** The background agents pending a task notification, and the count at the newest duration line: kept across a reload. */
       agents: { pending: string[]; last: number }
+      /** True while `/folder focus` is on for this session. */
+      focus: boolean
     }
   }
 }

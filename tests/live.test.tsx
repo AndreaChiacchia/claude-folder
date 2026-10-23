@@ -2,6 +2,8 @@ import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
+import type { FolderHeadProps, FolderShineProps } from '../types'
+
 // The real engine's order of events, with no `redraw()` before an assertion: a row drawn while the turn ran must update
 // by itself when the turn ends (the kit redraws mounted rows on the mod's state writes and on its invalidates).
 // Concurrency is modelled with `Promise.all`: `session.append` overlaps `turn.start` and `turn.complete`.
@@ -14,7 +16,7 @@ const VIEWPORT = { columns: 100, rows: 40, isFullscreen: true } as const
 type Node = { type?: string; props?: Record<string, unknown>; hover?: unknown; children?: unknown[] }
 
 /** The engine beneath the mod: every component draws ENGINE, tools and turns answer. */
-function world(on: On) {
+function world(on: On, failTools = false) {
   /** Every line the mod logged, in order (the debug lines of its decisions among them). */
   const logs: string[] = []
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -25,7 +27,8 @@ function world(on: On) {
   })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  on('tool.call', () => ({ result: 'ok' }) as never)
+  // With `failTools` every tool call answers with an error, as a failed Read would.
+  on('tool.call', () => (failTools ? { isError: true, result: 'boom' } : { result: 'ok' }) as never)
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('ui.render', ({ ui }, e) => {
     const { Text } = ui.resolve(e)
@@ -168,6 +171,16 @@ const duration = ($: Engine, requestId: string, durationMs: number, props: Recor
     viewport: VIEWPORT,
   })
 
+const toolResult = ($: Engine, requestId: string, props: Record<string, unknown> = {}) =>
+  $.ui.mount({
+    plugin: 'claudefolder',
+    surface: 'terminal',
+    component: 'ToolResult',
+    requestId,
+    props: { tool_use_id: requestId, tool: 'Bash', output: 'ok', isErrored: false, ...props } as never,
+    viewport: VIEWPORT,
+  })
+
 const group = ($: Engine, requestId: string, callIds: string[]) =>
   $.ui.mount({
     plugin: 'claudefolder',
@@ -200,7 +213,7 @@ type Poster = { post: (data: { type: string }, scope?: { in?: string }) => Promi
 const fault = (ui: Poster, n: number): Promise<void> => ui.post({ type: 'fault' }, { in: head(n) }).catch(() => undefined)
 
 const boxedStill = { options: { motion: 'off', style: 'boxed' } } as const
-const boxed = { options: { style: 'boxed' } } as const
+const boxed = { options: { style: 'boxed', shimmer: 'off' } } as const
 
 /** The open card's top line of turn `n` (one digit) at 100 columns: the marker and the number alone. */
 const cardTop = (n: number): string => '╭─ ▾ #' + n + ' ' + '─'.repeat(89) + '╮'
@@ -320,6 +333,34 @@ test('a row that took the expanded path still follows its turn', boxedStill, asy
   await Promise.all([$.turn.complete(answerOf('t1')), append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
   await w.clock.advance(1000)
   await expectFramed(b)
+})
+
+test('a command output clicked open stays inside the card, hides when the turn folds and is still open when it opens', boxedStill, async ($, on) => {
+  const w = world(on)
+  await append($, 'u1', 'prompt', 'user', say('test'))
+  const u = await user($, 'u1')
+  await $.turn.start({ text: 'test', turnId: 't1' } as never)
+  await append($, 'a1', 'response', 'assistant', [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }])
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'toolu_1', command: 'ls' } as never)
+  await append($, 'r1', 'tool-result', 'user', [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }])
+  await append($, 'b1', 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b1')
+  await Promise.all([$.turn.complete(answerOf('t1')), append($, 'd1', 'notice', 'system', say('Churned for 4s'), 'turn_duration')])
+  await duration($, 'd1', 4000)
+  await w.clock.advance(1000)
+  // The person clicked the command's output open: the engine reports it expanded, as it does for ctrl+o.
+  const out = await toolResult($, 'toolu_1', { isExpanded: true })
+  await expectFramed(out)
+  await folder($, 'close 1')
+  await quiet(w)
+  await expectHidden(out)
+  await expectHidden(b)
+  expect(await fullText(u)).toMatch(/▸ #1/)
+  await folder($, 'open 1')
+  await quiet(w)
+  await expectFramed(out)
+  expect(w.logs).toContain('claudefolder: draw ToolResult toolu_1 hidden')
+  expect(w.logs.filter(l => l.startsWith('claudefolder: invalidate view'))).toEqual([])
 })
 
 test('an agent message under a label does not flip the view', boxedStill, async ($, on) => {
@@ -715,3 +756,309 @@ for (const [name, options] of STYLES) {
     await expectFramed(second.b, bars)
   })
 }
+
+// ---- the last message's shimmer, failed turns, fold all, focus ---------------------------------
+
+type TurnValue = { turnId?: string; folded?: boolean; shine?: unknown; failedTools?: number }
+
+/** Every write the mod makes to a turn from now on, in order. */
+function turnWrites(on: On): TurnValue[] {
+  const out: TurnValue[] = []
+  on('state.set', (_$, e, next) => {
+    const write = e as unknown as { plugin?: string; key?: string; value?: unknown }
+    if (write.plugin === 'claudefolder' && write.key === 'turn') out.push(write.value as TurnValue)
+
+    return next(e)
+  })
+
+  return out
+}
+
+/** The newest write to turn `id`. */
+const lastOf = (writes: TurnValue[], id: string): TurnValue | undefined => writes.filter(t => t.turnId === id).pop()
+
+/** The props of the shimmer Client in a drawn row. */
+const shineOf = async (ui: Drawer): Promise<FolderShineProps | undefined> => clients(await ui.drawn())[0]?.props?.props as FolderShineProps | undefined
+
+/** The row draws the engine's own message: no Client in it. */
+async function expectEngine(ui: Drawer): Promise<void> {
+  const drawn = await ui.drawn()
+  expect(textOf(drawn)).toBe(ENGINE)
+  expect(clients(drawn)).toEqual([])
+}
+
+/**
+ * One turn `n` that ends on its reply `b<n>` ("Hello"): `tool` puts a tool call (and its result) before the reply, `toolAfter` a
+ * tool call after it, `props` go to the reply row, `reason` and `durationMs` end the turn. A second after it ends; no redraw.
+ */
+async function shinyTurn(
+  $: Engine,
+  w: World,
+  n: number,
+  o: { tool?: boolean; toolAfter?: boolean; props?: Record<string, unknown>; reason?: 'answer' | 'aborted'; durationMs?: number } = {},
+) {
+  const turnId = 't' + n
+  await append($, 'u' + n, 'prompt', 'user', say('test'))
+  const u = await user($, 'u' + n)
+  await Promise.all([$.turn.start({ text: 'test', turnId } as never), attach($, n)])
+  if (o.tool === true) {
+    await append($, 'a' + n, 'response', 'assistant', [{ type: 'tool_use', id: 'toolu_' + n, name: 'Read', input: {} }])
+    await $.tool.call({ tool: 'Read', tool_use_id: 'toolu_' + n } as never)
+    await append($, 'r' + n, 'tool-result', 'user', [{ type: 'tool_result', tool_use_id: 'toolu_' + n, content: 'boom' }])
+  }
+  await append($, 'b' + n, 'response', 'assistant', say('Hello'))
+  const b = await assistant($, 'b' + n, o.props ?? {})
+  if (o.toolAfter === true) await append($, 'c' + n, 'response', 'assistant', [{ type: 'tool_use', id: 'toolu_c' + n, name: 'Read', input: {} }])
+  const reason = o.reason ?? 'answer'
+  await Promise.all([
+    $.turn.complete({ answer: 'Hello', durationMs: o.durationMs ?? 4000, isAborted: reason === 'aborted', turnId, reason } as never),
+    append($, 'd' + n, 'notice', 'system', say('Churned for 4s'), 'turn_duration'),
+  ])
+  const d = await duration($, 'd' + n, o.durationMs ?? 4000)
+  await w.clock.advance(1000)
+
+  return { u, b, d }
+}
+
+const shiny = { options: { shimmer: 'gold' } } as const
+
+test('shimmer: the last message is drawn by the shimmer module for 3.7 s, then by the engine again with one write', shiny, async ($, on) => {
+  const w = world(on)
+  const writes = turnWrites(on)
+  const { b } = await liveTurn($, w, 1)
+  // The turn ended a second ago: the reply draws as the shimmer module, with its bullet, inside the rail's width.
+  expect(clients(await b.drawn()).map(keyOf)).toEqual(['folder-shine-1'])
+  expect(textOf(await b.drawn({ in: 'folder-shine-1' }))).toContain('● Hello')
+  const props = await shineOf(b)
+  expect(props).toMatchObject({ kind: 'shine', turnId: 't1', bullet: true, cols: 96, text: 0xffffff, base: 0xd4a017, peak: 0xfff1a8, strength: 1 })
+  expect(props?.lines).toEqual([{ kind: 'text', prefix: '', indent: 0, runs: [['Hello', 0]] }])
+  expect(w.logs).toContain('claudefolder: draw AssistantMessage b1 shine')
+  expect(lastOf(writes, 't1')?.shine).toMatchObject({ row: 'b1' })
+  // Drawn again later, it is told how long ago the shimmer started.
+  await w.clock.advance(2000)
+  await b.redraw()
+  expect((await shineOf(b))?.age).toBe(3000)
+  // At 3.7 s one write to the turn clears it and the engine draws the message again.
+  const before = writes.length
+  await w.clock.advance(800)
+  await w.clock.settle()
+  await expectEngine(b)
+  expect(writes.length - before).toBe(1)
+  expect(lastOf(writes, 't1')?.shine).toBeNull()
+})
+
+test('shimmer, boxed: the shimmer sits between the card sides, two columns narrower than the card', { options: { shimmer: 'gold', style: 'boxed' } }, async ($, on) => {
+  const w = world(on)
+  const { b } = await liveTurn($, w, 1)
+  const drawn = await b.drawn()
+  expect(clients(drawn).map(keyOf)).toEqual(['folder-shine-1'])
+  expect(sidesOf(drawn)).toBe(2)
+  expect((await shineOf(b))?.cols).toBe(94)
+})
+
+for (const [name, options] of [
+  ['shimmer off', { options: { shimmer: 'off' } }],
+  ['motion off', { options: { motion: 'off' } }],
+] as const) {
+  test(`shimmer: ${name} leaves the engine's drawing, and writes no shimmer`, options, async ($, on) => {
+    const w = world(on)
+    const writes = turnWrites(on)
+    const { b } = await liveTurn($, w, 1)
+    await expectEngine(b)
+    expect(writes.filter(t => t.shine != null)).toEqual([])
+  })
+}
+
+test('shimmer: a summary row, an interrupted turn and a reply followed by a tool call keep the engine drawing', shiny, async ($, on) => {
+  const w = world(on)
+  const summary = await shinyTurn($, w, 1, { props: { isSummary: true } })
+  await expectEngine(summary.b)
+  const aborted = await shinyTurn($, w, 2, { reason: 'aborted' })
+  await expectEngine(aborted.b)
+  const tooled = await shinyTurn($, w, 3, { toolAfter: true })
+  await expectEngine(tooled.b)
+  // A message over 120 lines is the engine's too.
+  const long = await shinyTurn($, w, 4, { props: { text: Array.from({ length: 121 }, () => 'x').join('\n') } })
+  await expectEngine(long.b)
+})
+
+test('shimmer: a click on the header mid-shimmer folds the turn at once, and reopening shows the engine', shiny, async ($, on) => {
+  const w = world(on)
+  const { u, b } = await liveTurn($, w, 1)
+  expect(clients(await b.drawn()).map(keyOf)).toEqual(['folder-shine-1'])
+  await click(u, head(1), 2, 0)
+  await quiet(w)
+  await expectHidden(b)
+  await click(u, head(1), 2, 0)
+  await quiet(w)
+  await expectEngine(b)
+})
+
+test("shimmer: the next turn ends the previous turn's shimmer with one write, and its timer writes nothing more", shiny, async ($, on) => {
+  const w = world(on)
+  const writes = turnWrites(on)
+  await liveTurn($, w, 1)
+  expect(lastOf(writes, 't1')?.shine).toMatchObject({ row: 'b1' })
+  await append($, 'u2', 'prompt', 'user', say('test'))
+  await $.turn.start({ text: 'test', turnId: 't2' } as never)
+  await quiet(w)
+  expect(lastOf(writes, 't1')).toMatchObject({ shine: null, folded: true })
+  const count = writes.filter(t => t.turnId === 't1').length
+  await w.clock.advance(4000)
+  await w.clock.settle()
+  expect(writes.filter(t => t.turnId === 't1').length).toBe(count)
+})
+
+test('shimmer, finish: the fold waits for the end of the shimmer, 3.7 s after the turn instead of 1.5 s', { options: { foldWhen: 'finish' } }, async ($, on) => {
+  const w = world(on)
+  const writes = turnWrites(on)
+  await liveTurn($, w, 1)
+  const folded = (): boolean => writes.some(t => t.turnId === 't1' && t.folded === true)
+  await w.clock.advance(1000)
+  await w.clock.settle()
+  expect(folded()).toBe(false)
+  await w.clock.advance(1600)
+  await w.clock.settle()
+  expect(folded()).toBe(false)
+  await w.clock.advance(200)
+  await w.clock.settle()
+  expect(folded()).toBe(true)
+})
+
+test('finish with the shimmer off: the fold comes 1.5 s after the turn', { options: { foldWhen: 'finish', shimmer: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const writes = turnWrites(on)
+  await liveTurn($, w, 1)
+  await w.clock.advance(600)
+  await w.clock.settle()
+  expect(writes.some(t => t.turnId === 't1' && t.folded === true)).toBe(true)
+})
+
+// ---- failed turns ------------------------------------------------------------------------------
+
+test('a failed tool call marks the turn: failedTools, a red cross, and a red fold lap', { options: { shimmer: 'off' } }, async ($, on) => {
+  const w = world(on, true)
+  const writes = turnWrites(on)
+  const { u } = await shinyTurn($, w, 1, { tool: true })
+  expect(lastOf(writes, 't1')?.failedTools).toBe(1)
+  expect(await fullText(u)).toContain('▾ #1 ✗')
+  await click(u, head(1), 2, 0)
+  await w.clock.settle()
+  const fx = (clients(await u.drawn())[0]?.props?.props as FolderHeadProps).fx
+  expect(fx).toMatchObject({ kind: 'fold', lapColor: 0xff0000 })
+  expect(await fullText(u)).toContain('#1 ✗')
+  // The unfold lap keeps the glint.
+  await click(u, head(1), 2, 0)
+  await w.clock.settle()
+  const unfold = (clients(await u.drawn())[0]?.props?.props as FolderHeadProps).fx
+  expect(unfold).toMatchObject({ kind: 'unfold' })
+  expect(unfold?.lapColor).toBeUndefined()
+})
+
+test('an interrupted turn folds with a red lap, and a turn that did not fail keeps the glint', { options: { shimmer: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const aborted = await shinyTurn($, w, 1, { reason: 'aborted' })
+  expect(await fullText(aborted.u)).toContain('▾ #1 ✗')
+  await click(aborted.u, head(1), 2, 0)
+  await w.clock.settle()
+  expect((clients(await aborted.u.drawn())[0]?.props?.props as FolderHeadProps).fx).toMatchObject({ kind: 'fold', lapColor: 0xff0000 })
+  const ok = await liveTurn($, w, 2)
+  expect(await fullText(ok.u)).not.toContain('✗')
+  await click(ok.u, head(2), 2, 0)
+  await w.clock.settle()
+  const fx = (clients(await ok.u.drawn())[0]?.props?.props as FolderHeadProps).fx
+  expect(fx).toMatchObject({ kind: 'fold' })
+  expect(fx?.lapColor).toBeUndefined()
+})
+
+test('motion off: a failed turn keeps its cross, and its fold plays no lap', { options: { motion: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const { u } = await shinyTurn($, w, 1, { reason: 'aborted' })
+  expect(await fullText(u)).toContain('▾ #1 ✗')
+  await click(u, head(1), 2, 0)
+  await w.clock.settle()
+  expect((clients(await u.drawn())[0]?.props?.props as FolderHeadProps).fx).toBeUndefined()
+  expect(await fullText(u)).toContain('▸ #1 ✗')
+})
+
+// ---- effort heat -------------------------------------------------------------------------------
+
+test("heat on: the edge bar of a folded header takes the turn's effort color", { options: { shimmer: 'off', heat: 'on' } }, async ($, on) => {
+  const w = world(on)
+  // 41 s with no tools: a medium turn, amber.
+  const first = await shinyTurn($, w, 1, { durationMs: 41_000 })
+  await liveTurn($, w, 2)
+  await w.clock.advance(3000)
+  const props = clients(await first.u.drawn())[0]?.props?.props as FolderHeadProps
+  expect(props.rows[0]![0]![2]).toBe(0xffaf00)
+})
+
+test('heat off (the default): the edge bar of a folded header stays teal', { options: { shimmer: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const first = await shinyTurn($, w, 1, { durationMs: 41_000 })
+  await liveTurn($, w, 2)
+  await w.clock.advance(3000)
+  const props = clients(await first.u.drawn())[0]?.props?.props as FolderHeadProps
+  expect(props.rows[0]![0]![2]).toBe(0x00afaf)
+})
+
+// ---- fold all on a new turn, focus mode --------------------------------------------------------
+
+test('foldAll on: a turn the user opened folds again when the next turn starts', { options: { shimmer: 'off', foldAll: 'on' } }, async ($, on) => {
+  const w = world(on)
+  const first = await liveTurn($, w, 1)
+  await liveTurn($, w, 2)
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await quiet(w)
+  await expectEngine(first.b)
+  await liveTurn($, w, 3)
+  await w.clock.advance(3000)
+  await expectHidden(first.b)
+})
+
+test('foldAll off (the default): a turn the user opened stays open when the next turn starts', { options: { shimmer: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const first = await liveTurn($, w, 1)
+  await liveTurn($, w, 2)
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await quiet(w)
+  await liveTurn($, w, 3)
+  await w.clock.advance(3000)
+  await expectEngine(first.b)
+})
+
+test('/folder focus folds every finished turn but the newest, and each new turn folds the ones before it', { options: { shimmer: 'off' } }, async ($, on) => {
+  const w = world(on)
+  const first = await liveTurn($, w, 1)
+  const second = await liveTurn($, w, 2)
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await quiet(w)
+  await expectEngine(first.b)
+  expect((await folder($, 'focus')).text).toBe('Focus on: folded 1 turn. Each new turn folds the ones before it.')
+  await quiet(w)
+  await expectHidden(first.b)
+  await expectEngine(second.b)
+  // A turn the user opens while focus is on folds again at the next turn.
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await quiet(w)
+  await liveTurn($, w, 3)
+  await w.clock.advance(3000)
+  await expectHidden(first.b)
+  await expectHidden(second.b)
+  // Off, turns fold as /config says (under next, only the turn that just ended): a turn the user opens stays open.
+  expect((await folder($, 'focus off')).text).toBe('Focus off: turns fold as set in /config.')
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await quiet(w)
+  await liveTurn($, w, 4)
+  await w.clock.advance(3000)
+  await expectEngine(first.b)
+})
+
+test('/folder focus on is the same as /folder focus, and anything else after it answers the usage', { options: { shimmer: 'off' } }, async ($, on) => {
+  world(on)
+  const usage = 'Usage: /folder (toggle all) · /folder open [<n> | last | all] · /folder close [<n> | last | all] · /folder focus [off]'
+  expect((await folder($, 'focus on')).text).toBe('Focus on: folded 0 turns. Each new turn folds the ones before it.')
+  expect((await folder($, 'focus x')).text).toBe(usage)
+  expect((await folder($, 'focus off now')).text).toBe(usage)
+  expect((await folder($, 'focus off')).text).toBe('Focus off: turns fold as set in /config.')
+})

@@ -6,10 +6,11 @@ import { BOX, EDGES, GOLD, MARKERS, PALETTES, hex, packCells, paletteFor, runsAl
 import type { Cell, HeadCell, Palette } from './cells'
 import { buildHeader, cardBottom, outlineOf } from './header'
 import type { HeaderModel } from './header'
-import { FOLD_DELAY_MS, FRAME_MS, LEVELS, composeRows, composeText, createMotion, lineCells, textRuns } from './motion'
+import { FOLD_DELAY_MS, FRAME_MS, LEVELS, SHINE_MAX_CHARS, SHINE_MAX_LINES, SHINE_MS, composeRows, composeText, createMotion, lineCells, textRuns } from './motion'
 import type { TextCell } from './motion'
 import { DEFAULT_SETTINGS, normalizeSettings } from './settings'
-import { fileOf, notificationTitleOf, replyOf, stripTags, titleOf } from './summary'
+import { shineFits, shineProps } from './shine'
+import { fileOf, isFailedTurn, notificationTitleOf, replyOf, stripTags, titleOf } from './summary'
 import { MAX_ROW_IDS, createTracker, onAgentLaunched, onAppend, onTurnComplete, onTurnStart, resumeLast, rowKeyOf } from './tracker'
 import type { Appended, AppendRow, Block, Tracker } from './tracker'
 
@@ -22,6 +23,10 @@ const KEY_PREFIX = 'fold-'
 const HEAD_PREFIX = 'folder-head-'
 /** The header's surface module, as its `Client` and the fault hook name it. */
 const HEAD_MODULE = 'headerClient.tsx'
+/** The key of the Client that draws a turn's last message while it shimmers. */
+const SHINE_PREFIX = 'folder-shine-'
+/** The shimmer's surface module, as its `Client` and the fault hook name it. */
+const SHINE_MODULE = 'shineClient.tsx'
 /** The lines of the edge bar that runs down an open turn's row: more than any row is tall, clipped to the row. */
 const RAIL_LINES = 400
 /** A fold or an unfold this recent (ms) is drawn by the header module as an effect. */
@@ -48,12 +53,14 @@ const START_KINDS: readonly string[] = ['typed', 'peer', 'notification', 'other'
 const MAIN_SCREEN_TEXT =
   'Claude-Folder folds turns in the fullscreen view only. Turn it on with "tui": "fullscreen" in your settings, or CLAUDE_CODE_NO_FLICKER=1.'
 const USAGE_TEXT =
-  'Usage: /folder (toggle all) · /folder open [<n> | last | all] · /folder close [<n> | last | all]'
+  'Usage: /folder (toggle all) · /folder open [<n> | last | all] · /folder close [<n> | last | all] · /folder focus [off]'
 
 /** The mod's state references are written inline at each call: the plugin and key stay literals in source; only the id is computed. */
 const order = atom({ plugin: 'claudefolder', key: 'order' } as const, [])
 /** The background agents the tracker follows (`Tracker.agents`, `Tracker.lastPending`), so a reload goes on counting them. */
 const agentsAtom = atom({ plugin: 'claudefolder', key: 'agents' } as const, { pending: [], last: 0 })
+/** True while `/folder focus` is on for this session: kept in the state across a reload, off after a restart. */
+const focusAtom = atom({ plugin: 'claudefolder', key: 'focus' } as const, false)
 
 /** The /config settings, read in `register`: a module variable, so /clear and /resume keep them; a /config change reloads the module. */
 let settings: Settings = DEFAULT_SETTINGS
@@ -70,10 +77,13 @@ let tracker: Tracker = createTracker()
 /** The header's cells at rest come from `composeRows` and `composeText` at level `off`, which read no motion state. */
 const restMotion = createMotion()
 /** What the main loop did in each turn so far: tool calls and edited files, written to the turn when it completes. */
-const counters = new Map<string, { tools: number; files: string[] }>()
+const counters = new Map<string, { tools: number; files: string[]; failed: number }>()
 /** The timers that fold a turn a moment after it ends (`foldWhen: finish`). */
 const foldTimers = new Map<string, Timer>()
-/** True while the last row drawn that carries the flag was drawn in full (ctrl+o, --verbose): rows without the flag follow it. */
+/**
+ * True while the view draws every row in full (ctrl+o, --verbose), as the last TurnDuration row drawn says: a duration line is
+ * never opened by a click, so its flag is the view's alone; any other row's flag is also set by a click that opens that row by itself.
+ */
 let lastExpandedView = false
 /** The turns whose header row has drawn in this load: only their other rows may hide when folded. */
 const headerSeen = new Set<string>()
@@ -97,6 +107,13 @@ const headerChange = new Map<string, { changedAt: number; animate: boolean }>()
 const lastOutcome = new Map<string, string>()
 /** Set when the header's surface module fails: every header is drawn as plain Text with Buttons over its text, and no outline light. */
 let clientFailed = false
+/** Set when the shimmer's surface module fails: every last message is drawn by the engine. */
+let shineFailed = false
+/** The turn whose last message shimmers now, and the timer that ends it. */
+let shineTurn: string | null = null
+let shineTimer: Timer | null = null
+/** True while `/folder focus` is on: every earlier turn folds when a turn starts. */
+let focusOn = false
 /** The number the next turn gets. */
 let nextN = 1
 /** True once this load has read the state it continues from (numbering, a running turn, the theme); see `ensureRecovered`. */
@@ -121,6 +138,8 @@ type RowProps = {
   from?: { name?: string }
   task?: unknown
   text?: string
+  isFirstOfReply?: boolean
+  isSummary?: true
 }
 
 /** True when this load has seen the turn's header change fold state since it first drew it: only such a change is drawn as an effect. */
@@ -161,6 +180,8 @@ function foldFx(turn: FolderTurn, model: HeaderModel, now: number): FoldFx | und
     marker: [model.marker.row, model.marker.col, rest.cp, rest.fg, other.cp, other.fg],
     flash: L.flash,
     gold: GOLD,
+    // A failed turn's fold runs its lap in red; unfold laps and hover laps keep the glint.
+    ...(turn.folded && isFailedTurn(turn) ? { lapColor: palette.fail } : {}),
   }
 }
 
@@ -187,6 +208,7 @@ function headRest(turn: FolderTurn, title: string, columns: number): { model: He
     palette,
     columns,
     folded: turn.folded,
+    heat: settings.heat,
   })
   const rows: Cell[][] = composeRows(restMotion, turn.turnId, model, settings.marker, palette, 'off')
   const texts = composeText(restMotion, turn.turnId, model, palette, 'off')
@@ -305,6 +327,23 @@ async function setFolded($: EngineInterface, turnId: string, folded: boolean, no
 /** Folds a finished turn by the `next` rule, unless it folded once already or the user chose; decided at write time. */
 async function autoFold($: EngineInterface, turnId: string, now: number): Promise<void> {
   await changeTurn($, turnId, t => (t.status === 'running' || t.autoFolded ? null : { ...t, folded: true, autoFolded: true, changedAt: now }))
+}
+
+/** Folds a finished turn for `foldAll` or focus mode, whatever its state: the user's own opening included; a running or folded turn is left alone. */
+async function forceFold($: EngineInterface, turnId: string, now: number): Promise<void> {
+  foldTimers.get(turnId)?.cancel()
+  foldTimers.delete(turnId)
+  await changeTurn($, turnId, t => (t.status === 'running' || t.folded ? null : { ...t, folded: true, autoFolded: true, changedAt: now }))
+}
+
+/** Ends the last message's shimmer of a turn: its field is cleared (one write, which draws the turn's rows again) and the timer stops. */
+async function clearShine($: EngineInterface, turnId: string): Promise<void> {
+  await changeTurn($, turnId, t => (t.shine == null ? null : { ...t, shine: null }))
+  if (shineTurn === turnId) {
+    shineTurn = null
+    shineTimer?.cancel()
+    shineTimer = null
+  }
 }
 
 /**
@@ -435,7 +474,7 @@ function redrawAll($: EngineInterface, reason: string): void {
 
 /**
  * Asks one redraw of every row a frame from now, for what a row cannot follow through the state it reads (a header drawn
- * for the first time, a row filed under another turn). Asks made while one waits share it.
+ * for the first time, a row filed under another turn, the view switching to or from ctrl+o). Asks made while one waits share it.
  */
 function askRedraw($: EngineInterface, reason: string): void {
   if (redrawPending) return
@@ -609,6 +648,8 @@ function savedTurnOf(v: unknown): SavedTurn | null {
   const startKind =
     typeof o.startKind === 'string' && START_KINDS.includes(o.startKind as string) ? (o.startKind as FolderTurn['startKind']) : undefined
 
+  const failedTools = typeof o.failedTools === 'number' && Number.isFinite(o.failedTools) && o.failedTools >= 0 ? o.failedTools : undefined
+
   return {
     n: o.n as number,
     turnId: o.turnId as string,
@@ -624,6 +665,7 @@ function savedTurnOf(v: unknown): SavedTurn | null {
     changedAt: o.changedAt as number,
     closer: o.closer as string | null,
     ...(startKind === undefined ? {} : { startKind }),
+    ...(failedTools === undefined ? {} : { failedTools }),
     ids: [...(o.ids as string[])],
   }
 }
@@ -717,7 +759,7 @@ async function recover($: EngineInterface): Promise<void> {
         tracker.running = newest
         tracker.runningHeader = member.header
         if (member.header !== null) tracker.headers.set(newest, member.header)
-        counters.set(newest, { tools: member.tools, files: [...member.files] })
+        counters.set(newest, { tools: member.tools, files: [...member.files], failed: member.failedTools ?? 0 })
         turnNumbers.set(newest, member.n)
         running = newest
       }
@@ -744,6 +786,8 @@ async function recover($: EngineInterface): Promise<void> {
     } catch {
       palette = PALETTES.dark
     }
+    // Focus mode goes on across a reload (it is off after a restart: the state is empty).
+    focusOn = await read($, focusAtom)
   } catch {
     // A failed read leaves the numbering and the tracker as a fresh load has them.
   }
@@ -823,6 +867,27 @@ async function runFolder($: EngineInterface, args: string): Promise<string> {
     return `${open ? 'Opened' : 'Folded'} ${plural(turns.length)}.`
   }
   const verb = words[0]
+  if (verb === 'focus') {
+    if (words.length === 1 || (words.length === 2 && words[1] === 'on')) {
+      focusOn = true
+      await $.state.set({ plugin: 'claudefolder', key: 'focus' } as const, true)
+      // Every finished turn but the newest folds now; each new turn folds the ones before it.
+      const ids = await read($, order)
+      const newest = ids[ids.length - 1]
+      const targets = turns.filter(t => t.turnId !== newest && !t.folded)
+      await apply(targets, true)
+
+      return `Focus on: folded ${plural(targets.length)}. Each new turn folds the ones before it.`
+    }
+    if (words.length === 2 && words[1] === 'off') {
+      focusOn = false
+      await $.state.set({ plugin: 'claudefolder', key: 'focus' } as const, false)
+
+      return 'Focus off: turns fold as set in /config.'
+    }
+
+    return USAGE_TEXT
+  }
   if ((verb !== 'open' && verb !== 'close') || words.length > 2) return USAGE_TEXT
   const folded = verb === 'close'
   const word = folded ? 'Folded' : 'Opened'
@@ -863,6 +928,11 @@ export const register: Register = (on, options) => {
   // A fresh load starts from a clean state.
   for (const t of foldTimers.values()) t.cancel()
   foldTimers.clear()
+  shineTimer?.cancel()
+  shineTimer = null
+  shineTurn = null
+  shineFailed = false
+  focusOn = false
   tracker = createTracker()
   counters.clear()
   lastExpandedView = false
@@ -891,8 +961,8 @@ export const register: Register = (on, options) => {
     if (!recovered) await ensureRecovered($)
     await $.command.register({
       name: 'folder',
-      description: 'Fold or unfold finished turns: /folder toggles them all; open or close one by number, the last or all',
-      argumentHint: '[open | close] [<n> | last | all]',
+      description: 'Fold or unfold finished turns: /folder toggles them all; open or close one by number, the last or all; focus keeps only the newest open',
+      argumentHint: '[open | close] [<n> | last | all] | focus [off]',
     })
     // No invalidate here: the recovery asked the load's one redraw.
 
@@ -905,6 +975,12 @@ export const register: Register = (on, options) => {
     await saveSession($)
     for (const t of foldTimers.values()) t.cancel()
     foldTimers.clear()
+    shineTimer?.cancel()
+    shineTimer = null
+    shineTurn = null
+    shineFailed = false
+    focusOn = false
+    await $.state.set({ plugin: 'claudefolder', key: 'focus' } as const, false)
     tracker = createTracker()
     counters.clear()
     headerSeen.clear()
@@ -956,6 +1032,8 @@ export const register: Register = (on, options) => {
     if (!recovered) await ensureRecovered($)
     const turnId = e.turnId
     const res = onTurnStart(tracker, turnId)
+    // A new turn ends the shimmer of the one before.
+    if (shineTurn !== null) await clearShine($, shineTurn)
     const now = await $.clock.now()
     // Only the first turn.start of a load looks at every earlier turn; later ones fold the turns this load saw complete.
     const scan = settings.foldWhen === 'next' && foldScanNeeded
@@ -987,8 +1065,14 @@ export const register: Register = (on, options) => {
     )
     await $.state.set({ plugin: 'claudefolder', key: 'turn', id: turnId } as const, turn)
     await update($, order, ids => [...ids, turnId])
-    counters.set(turnId, { tools: 0, files: [] })
-    if (settings.foldWhen === 'next') {
+    counters.set(turnId, { tools: 0, files: [], failed: 0 })
+    if (settings.foldAll || focusOn) {
+      // Fold all on a new turn, or focus mode: every earlier turn folds, the ones the user opened included, whatever `foldWhen` says.
+      const all = await read($, order)
+      foldScanNeeded = false
+      foldCandidates.clear()
+      await Promise.all(all.filter(id => id !== turnId).map(id => forceFold($, id, now)))
+    } else if (settings.foldWhen === 'next') {
       // Each fold is a write to that turn: its rows draw again on their own (no invalidate).
       const targets = scan ? prior : [...foldCandidates]
       foldScanNeeded = false
@@ -1018,6 +1102,11 @@ export const register: Register = (on, options) => {
       }
     }
     const r = await next(e)
+    // A tool call of the main loop that failed (an error, or a refusal) marks its turn: a red mark and a red lap.
+    if (e.agentId === undefined && running !== null && (r.isError === true || r.deny !== undefined)) {
+      const c = counters.get(running)
+      if (c !== undefined) c.failed += 1
+    }
     // A background agent the main loop launched or resumed: pending until its task notification (the duration rule).
     if (e.agentId === undefined && (e.tool === 'Agent' || e.tool === 'SendMessage') && r.deny === undefined) {
       const id = launchedAgentOf(r.result)
@@ -1042,18 +1131,43 @@ export const register: Register = (on, options) => {
       const reply = replyOf(e.answer)
       const status = e.reason === 'aborted' ? 'interrupted' : e.reason === 'answer' ? 'done' : 'error'
       const late = tracker.lateCommands.get(turnId)
+      // The turn's last message shimmers when the turn answered, the message is known and small enough, and the shimmer is on.
+      const last = tracker.lastText.get(turnId) ?? null
+      tracker.lastText.delete(turnId)
+      const applies =
+        settings.shimmer !== 'off' &&
+        settings.motion !== 'off' &&
+        !shineFailed &&
+        e.reason === 'answer' &&
+        last !== null &&
+        last.chars <= SHINE_MAX_CHARS &&
+        last.lines <= SHINE_MAX_LINES
+      const shineAt = applies ? await $.clock.now() : 0
+      const shine = applies && last !== null ? { row: last.key, at: shineAt } : null
       await changeTurn($, turnId, t => ({
         ...t,
         title: late === undefined ? t.title : titleOf('', late),
         reply,
         tools: c === undefined ? t.tools : c.tools,
         files: c === undefined ? t.files : [...c.files],
+        failedTools: c === undefined ? (t.failedTools ?? 0) : c.failed,
         durationMs: e.durationMs,
         status,
         // The final values come from memory at the end: a lost race during the turn cannot leave them empty.
         header: tracker.headers.get(turnId) ?? t.header ?? null,
         closer: tracker.closers.get(turnId)?.id ?? t.closer,
+        shine,
       }))
+      if (applies) {
+        // One shimmer at a time: the previous turn's (if any) ends, and this one's own timer clears the field when it is over.
+        if (shineTurn !== null && shineTurn !== turnId) void clearShine($, shineTurn).catch(() => undefined)
+        shineTimer?.cancel()
+        shineTurn = turnId
+        shineTimer = $.clock.after(SHINE_MS, () => {
+          shineTimer = null
+          void clearShine($, turnId).catch(() => undefined)
+        })
+      }
       $.ui.log(
         `claudefolder: turn.complete ${turnNumbers.get(turnId) ?? '?'} header=${shortId(tracker.headers.get(turnId))} closer=${shortId(tracker.closers.get(turnId)?.id)} status=${status}`,
         { to: 'debug' },
@@ -1064,7 +1178,7 @@ export const register: Register = (on, options) => {
       if (settings.foldWhen === 'finish') {
         foldTimers.set(
           turnId,
-          $.clock.after(FOLD_DELAY_MS, () => {
+          $.clock.after(applies ? SHINE_MS : FOLD_DELAY_MS, () => {
             foldTimers.delete(turnId)
             void (async () => {
               const now = await $.clock.now()
@@ -1097,12 +1211,17 @@ export const register: Register = (on, options) => {
       // write to that turn draws it again. Any other row reads its row member (and a group its calls'), as before.
       const id = knownTurnOf(requestId, component, props) ?? (await turnIdOf($, requestId, component, props))
       const turn = id === undefined ? undefined : await read($, { plugin: 'claudefolder', key: 'turn', id } as const)
-      // An agent's message or a notification can be drawn whole under a speaker label in the normal view: its flag is not the view's.
-      const isMessageRow = component === 'UserMessage' && (props.from !== undefined || props.task !== undefined)
-      if (component === 'TurnDuration' || (component === 'UserMessage' && !isMessageRow)) lastExpandedView = props.isExpanded === true
-      const followsView = component === 'AssistantMessage' || component === 'CommandOutput' || isMessageRow
+      // The view is read from the duration lines alone: a click can open any other row by itself, and its flag is not the view's.
+      if (component === 'TurnDuration') {
+        const view = props.isExpanded === true
+        if (view !== lastExpandedView) {
+          lastExpandedView = view
+          $.ui.log(`claudefolder: view ${view ? 'expanded' : 'normal'}`, { to: 'debug' })
+          askRedraw($, 'view')
+        }
+      }
       // ctrl+o and --verbose draw every row in full.
-      if ((props.isExpanded === true && !isMessageRow) || (followsView && lastExpandedView)) {
+      if (lastExpandedView) {
         noteDraw($, component, requestId, 'expanded')
         return next(e)
       }
@@ -1140,6 +1259,46 @@ export const register: Register = (on, options) => {
       const scope = SCOPE_PREFIX + turn.n
       const columns = e.viewport?.columns ?? DEFAULT_COLUMNS
       const W = Math.max(20, Math.min(512, columns) - 2)
+      // The turn's last message while it shimmers: drawn by the shimmer module in place of the engine's drawing. The shimmer
+      // ends by itself (the turn's `shine` field is cleared at its end), at once on a fold or an open (`changedAt` moves past
+      // its start), and on the next turn; the row then draws the engine's own message again.
+      let shineNode: JSX.Element | null = null
+      if (
+        component === 'AssistantMessage' &&
+        turn.shine != null &&
+        rowKeyOf(turn.shine.row) === requestId &&
+        !turn.folded &&
+        turn.changedAt <= turn.shine.at &&
+        props.isSummary !== true &&
+        settings.shimmer !== 'off' &&
+        settings.motion !== 'off' &&
+        !shineFailed &&
+        Client !== undefined &&
+        typeof props.text === 'string' &&
+        shineFits(props.text)
+      ) {
+        const age = (await $.clock.now()) - turn.shine.at
+        if (age >= 0 && age < SHINE_MS) {
+          const cols = isRail ? Math.max(20, columns - 4) : isBoxed ? W - 4 : Math.max(20, columns - 2)
+          shineNode = (
+            <Client
+              key={SHINE_PREFIX + turn.n}
+              module="./shineClient.tsx"
+              width={cols}
+              props={shineProps({
+                turnId: turn.turnId,
+                text: props.text,
+                bullet: props.isFirstOfReply === true,
+                age,
+                cols,
+                palette,
+                shimmer: settings.shimmer,
+                motion: settings.motion,
+              })}
+            />
+          )
+        }
+      }
       // The row under which an open card closes: the turn's closer row (a call's own row never closes it; its result row does).
       const closer = turn.closer
       const isCloser =
@@ -1188,22 +1347,24 @@ export const register: Register = (on, options) => {
         </Box>
       )
       if (!isHeader) {
-        noteDraw($, component, requestId, turn.folded ? 'open-unseen' : isRail ? 'railed' : isBoxed ? 'framed' : 'plain')
+        noteDraw($, component, requestId, shineNode !== null ? 'shine' : turn.folded ? 'open-unseen' : isRail ? 'railed' : isBoxed ? 'framed' : 'plain')
         // The bars start at the row's first line on screen: the closer's bottom border is the one row of the tree below them.
         const top = barStart(props.onScreen, 0, isBoxed && isCloser ? 1 : 0)
+        // The shimmer's drawing in place of the engine's: the engine's drawing is not asked for then.
+        if (shineNode !== null) return isRail ? railed(shineNode, top) : isBoxed ? framed(shineNode, isCloser, top) : shineNode
         if (isRail) return railed(await next(e), top)
         if (isBoxed) return framed(await next(e), isCloser, top)
 
         return next(e)
       }
-      noteDraw($, component, requestId, turn.folded ? 'header-folded' : 'header-open')
+      noteDraw($, component, requestId, shineNode !== null ? 'shine' : turn.folded ? 'header-folded' : 'header-open')
 
       // The header: drawn by its surface module, which hears the pointer; if the module has failed, as plain Text with Buttons over the text.
       const folded = turn.folded
       // Only a fold or an unfold this load saw is drawn as an effect, and only then is the clock read.
       const animate = Client !== undefined && !clientFailed && settings.motion !== 'off' && seesChange(turn)
       const now = animate ? await $.clock.now() : 0
-      const engine = folded ? null : await next(e)
+      const engine = folded ? null : (shineNode ?? (await next(e)))
       // The header at rest, built once per change of what it shows: the module animates it itself from these cells.
       const rest = headRest(turn, displayTitle(turn, component, props), columns)
       const model = rest.model
@@ -1320,6 +1481,10 @@ export const register: Register = (on, options) => {
   on('ui.fault', async ($, e, next) => {
     if (e.module.endsWith(HEAD_MODULE)) {
       clientFailed = true
+      redrawAll($, 'fault')
+    } else if (e.module.endsWith(SHINE_MODULE)) {
+      // A shimmer module that fails is left out: every last message is drawn by the engine; the headers are untouched.
+      shineFailed = true
       redrawAll($, 'fault')
     }
 

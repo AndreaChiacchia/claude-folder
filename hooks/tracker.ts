@@ -62,6 +62,8 @@ export type Tracker = {
   agents: Set<string>
   /** How many were pending at the newest duration line; 0 again after a prompt the person typed. */
   lastPending: number
+  /** By turnId: the running turn's newest response row with text, unless a tool call came after it; `chars` and `lines` size its text. */
+  lastText: Map<string, { key: string; chars: number; lines: number } | null>
 }
 
 /** The most row keys kept per turn. */
@@ -80,6 +82,7 @@ export function createTracker(): Tracker {
     ids: new Map(),
     agents: new Set(),
     lastPending: 0,
+    lastText: new Map(),
   }
 }
 
@@ -444,6 +447,15 @@ export function onAppend(t: Tracker, row: AppendRow): Appended {
       }
     }
     rememberIds(t, t.running, ids)
+    // The turn's last message: its newest response row with text, unless a tool call came after it.
+    if (row.door === 'response') {
+      if (row.blocks.some(b => b.type === 'tool_use')) {
+        t.lastText.set(t.running, null)
+      } else if (hasText(row)) {
+        const text = textOf(row) ?? ''
+        t.lastText.set(t.running, { key: rowKeyOf(row.uuid), chars: text.length, lines: text.split('\n').length })
+      }
+    }
     // A notification or a hand-back after the turn's end was seen (its duration line, drawn or not) but before `turn.complete`
     // reached the tracker: it starts no turn of its own, so the card closes under it, as for the same row arriving while idle.
     const start = startKindOf(row)

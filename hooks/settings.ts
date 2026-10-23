@@ -1,4 +1,4 @@
-import type { Edge, FoldWhen, Marker, Motion, Settings, Style } from '../types'
+import type { Edge, FoldWhen, Marker, Motion, Settings, Shimmer, Style } from '../types'
 
 export const DEFAULT_SETTINGS: Settings = {
   style: 'rail',
@@ -7,6 +7,9 @@ export const DEFAULT_SETTINGS: Settings = {
   marker: 'triangles',
   edge: 'half',
   motion: 'lively',
+  shimmer: 'gold',
+  heat: false,
+  foldAll: false,
 }
 
 /** `value` when it is one of `options`, else `fallback`. */
@@ -23,5 +26,8 @@ export function normalizeSettings(options: Record<string, unknown>): Settings {
     marker: pick<Marker>(options.marker, ['triangles', 'hollow', 'plus', 'ascii'], DEFAULT_SETTINGS.marker),
     edge: pick<Edge>(options.edge, ['half', 'thin', 'line', 'ascii'], DEFAULT_SETTINGS.edge),
     motion: pick<Motion>(options.motion, ['lively', 'subtle', 'off'], DEFAULT_SETTINGS.motion),
+    shimmer: pick<Shimmer>(options.shimmer, ['gold', 'text', 'teal', 'silver', 'lavender', 'off'], DEFAULT_SETTINGS.shimmer),
+    heat: options.heat === 'on',
+    foldAll: options.foldAll === 'on',
   }
 }

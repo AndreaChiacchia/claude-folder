@@ -579,3 +579,60 @@ test('rows filed while a turn runs are saved within 10 s, before it ends', still
   await w.clock.settle()
   expect(entryOf(w).turns[0]!.ids).toEqual(['u1', 'a1', 'toolu_1', 'r1', 'b1'])
 })
+
+// ---- failed tools, the shimmer, focus ------------------------------------------------------
+
+test('restart: failedTools comes back and is saved again, and a shimmer never comes back', still, async ($, on) => {
+  const turn = savedTurn(1, { failedTools: 3, shine: { row: 'b1', at: 5 }, header: 'u1', ids: ['u1'], folded: false })
+  const w = world(on, { 'session:sess-a': savedSession([turn], 2) })
+  await $.session.start({ cwd: 'C:\\src', surface: 'terminal', isInteractive: true } as never)
+  expect(w.logs).toContain('claudefolder: restored 1 turns next=2')
+  const member = w.writes
+    .filter(x => x.key === 'turn')
+    .map(x => x.value as FolderTurn)
+    .filter(t => t.turnId === 'old1')
+    .pop()
+  expect(member?.failedTools).toBe(3)
+  expect(member?.shine).toBeUndefined()
+  // The restored turn is a failed one: its open header has the cross.
+  expect(await fullText(await user($, 'u1'))).toBe('▌ ▾ #1 ✗' + sp(90) + ENGINE)
+  expect((await folder($, 'close 1')).text).toBe('Folded turn #1.')
+  await saved(w)
+  expect(entryOf(w).turns[0]).toMatchObject({ turnId: 'old1', failedTools: 3 })
+  expect(entryOf(w).turns[0]!.shine ?? null).toBeNull()
+})
+
+test('restart: a malformed failedTools is left out, a good one is kept', still, async ($, on) => {
+  const turns = [
+    { ...savedTurn(1), failedTools: 'many' } as unknown as SavedTurn,
+    { ...savedTurn(2), failedTools: -1 } as unknown as SavedTurn,
+    savedTurn(3, { failedTools: 0 }),
+  ]
+  const w = world(on, { 'session:sess-a': savedSession(turns, 4) })
+  await $.session.start({ cwd: 'C:\\src', surface: 'terminal', isInteractive: true } as never)
+  const members = w.writes.filter(x => x.key === 'turn').map(x => x.value as FolderTurn)
+  expect(members.find(t => t.turnId === 'old1')?.failedTools).toBeUndefined()
+  expect(members.find(t => t.turnId === 'old2')?.failedTools).toBeUndefined()
+  expect(members.find(t => t.turnId === 'old3')?.failedTools).toBe(0)
+})
+
+test('restart: focus mode is off after a restart', still, async ($, on) => {
+  const w = world(on)
+  await runTurn($, 1)
+  await runTurn($, 2)
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  expect((await folder($, 'focus')).text).toBe('Focus on: folded 1 turn. Each new turn folds the ones before it.')
+  // The user opens turn 1 again while focus is on.
+  expect((await folder($, 'open 1')).text).toBe('Opened turn #1.')
+  await saved(w)
+  await restart($, w)
+  const u1 = await user($, 'u1')
+  const u2 = await user($, 'u2')
+  expect(await fullText(u1)).toBe(OPEN(1) + ENGINE)
+  await runTurn($, 3)
+  await u1.redraw()
+  await u2.redraw()
+  // Focus would have folded turn 1 at the new turn; off, only the turn that just ended folds.
+  expect(await fullText(u2)).toBe(FOLDED(2))
+  expect(await fullText(u1)).toBe(OPEN(1) + ENGINE)
+})

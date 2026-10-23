@@ -1,4 +1,4 @@
-import type { Edge, Marker } from '../types'
+import type { Edge, Marker, Shimmer } from '../types'
 
 /** The terminal's default color, as a Raster cell holds it (bit 24 alone). */
 export const DEFAULT = 0x01000000
@@ -19,6 +19,8 @@ export const GLYPH = {
   /** The branch of the second line (claudespotter's tree). */
   branch: 0x2514,
   ellipsis: 0x2026,
+  /** The mark after a failed turn's number. */
+  fail: 0x2717,
 }
 
 /** The marker pairs by code point. All narrow (East Asian Neutral or ASCII). */
@@ -71,6 +73,16 @@ export type Palette = {
   hoverReply: number
   /** `interrupted` and `error`. */
   fail: number
+  /** The reply's text color as the theme draws it: the shimmer fades from and back to it. */
+  text: number
+  /** Effort heat, a quick turn. */
+  heatQuick: number
+  /** Effort heat, a medium turn. */
+  heatMedium: number
+  /** Effort heat, a heavy turn. */
+  heatHeavy: number
+  /** The last message's shimmer by preset: the tint, then the highlight. */
+  shimmers: Record<Exclude<Shimmer, 'off'>, { base: number; peak: number }>
 }
 
 export const PALETTES: { dark: Palette; light: Palette } = {
@@ -92,6 +104,17 @@ export const PALETTES: { dark: Palette; light: Palette } = {
     hoverTitle: 0xfff5d7,
     hoverReply: 0xd0d0d0,
     fail: 0xff0000,
+    text: 0xffffff,
+    heatQuick: 0x00afaf,
+    heatMedium: 0xffaf00,
+    heatHeavy: 0xff5f00,
+    shimmers: {
+      gold: { base: 0xd4a017, peak: 0xfff1a8 },
+      text: { base: 0xb2b2b2, peak: 0xffffff },
+      teal: { base: 0x00afaf, peak: 0xafffff },
+      silver: { base: 0x9e9e9e, peak: 0xffffff },
+      lavender: { base: 0xaf87d7, peak: 0xe4d7ff },
+    },
   },
   light: {
     title: 0x008787,
@@ -111,6 +134,17 @@ export const PALETTES: { dark: Palette; light: Palette } = {
     hoverTitle: 0x005f5f,
     hoverReply: 0x3a3a3a,
     fail: 0xd70000,
+    text: 0x000000,
+    heatQuick: 0x00afaf,
+    heatMedium: 0xd78700,
+    heatHeavy: 0xd75f00,
+    shimmers: {
+      gold: { base: 0xa67c00, peak: 0xe0b000 },
+      text: { base: 0x6c6c6c, peak: 0x000000 },
+      teal: { base: 0x008787, peak: 0x00d7d7 },
+      silver: { base: 0x6c6c6c, peak: 0x262626 },
+      lavender: { base: 0x8a63c7, peak: 0xb48cff },
+    },
   },
 }
 
