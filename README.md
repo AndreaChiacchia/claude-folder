@@ -1,6 +1,6 @@
 # Claude-Folder
 
-![version](https://img.shields.io/badge/version-0.1.3-blue)
+![version](https://img.shields.io/badge/version-0.2.0-blue)
 
 A mod for the Claude Code CLI that folds each finished turn of the chat into one or two highlighted lines. A long session is mostly old turns you are done reading: the prompt, a screenful of tool calls, an answer, a "Baked for 41s". Claude-Folder keeps the prompt, the turn number, the first line of the answer, the tool count, the files it edited and the time, and hides the rest behind a click. The newest turn stays open until you send the next prompt, a click on any folded turn opens it again, each turn stands apart (a tinted band and a teal edge bar by default, or a card, alternating tints or a rule; setting `style`), and a gliding light runs over the folds so the transcript doesn't sit dead. When a turn ends, its last message (most of the time the summary) shimmers for a moment (setting `shimmer`).
 
