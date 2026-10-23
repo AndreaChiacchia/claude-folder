@@ -1,6 +1,6 @@
 {
   "name": "claudefolder",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Folds each finished turn of the chat into one or two highlighted lines (the prompt, the turn number, the first line of the answer, the tools, the edited files and the time) that unfold with a click, set apart by a tinted band and an edge bar, a card, alternating tints or a rule, with a gliding light over the folds and a shimmer over each turn's last message",
   "author": { "name": "AndreaChiacchia", "url": "https://github.com/AndreaChiacchia" },
   "types": "./types/index.d.ts",
